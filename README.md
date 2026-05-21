@@ -48,8 +48,9 @@ pnpm build
 pnpm start
 ```
 
-Environment variables are read directly from the process — load your `.env`
-with whatever you use locally (e.g. `direnv` or `node --env-file=.env`).
+Both `pnpm start` and `pnpm dev` auto-load `.env` from the project root via
+Node's `--env-file-if-exists` flag. To skip the file, run `node dist/index.js`
+directly with the env injected another way (`direnv`, container env, etc.).
 
 ## Configuration
 
