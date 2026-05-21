@@ -1,23 +1,29 @@
 import type { Config } from "./config.js";
 import type { Logger } from "./logger.js";
 import { PRIORITY_RANK, type PlaneApi, type PlaneIssue } from "./plane.js";
+import { Planner, PlanningError } from "./planner.js";
 import type { Store } from "./store.js";
 
 export class Orchestrator {
   private timer?: NodeJS.Timeout;
   private inFlightCycle = false;
+  private inFlightPlanning?: Promise<void>;
   private stopped = false;
   private inProgressStateId?: string;
   private resolveStop?: () => void;
+  private readonly planner: Planner;
 
   constructor(
     private readonly logger: Logger,
     private readonly config: Config,
     private readonly plane: PlaneApi,
     private readonly store: Store,
-  ) {}
+  ) {
+    this.planner = new Planner(logger, config, plane, store);
+  }
 
   async start(): Promise<void> {
+    await this.planner.ensureReady();
     this.inProgressStateId = await this.plane.findStateIdByName(
       this.config.plane.inProgressStatus,
     );
@@ -26,6 +32,7 @@ export class Orchestrator {
         stateName: this.config.plane.inProgressStatus,
         stateId: this.inProgressStateId,
         pollIntervalMs: this.config.pollIntervalMs,
+        summarioRepo: this.config.summario.repoPath,
       },
       "orchestrator started",
     );
@@ -48,6 +55,14 @@ export class Orchestrator {
       await new Promise<void>((resolve) => {
         this.resolveStop = resolve;
       });
+    }
+    if (this.inFlightPlanning) {
+      this.logger.info("waiting for in-flight planning run to finish");
+      try {
+        await this.inFlightPlanning;
+      } catch (err) {
+        this.logger.error({ err }, "in-flight planning errored during shutdown");
+      }
     }
     this.logger.info("orchestrator stopped");
   }
@@ -149,7 +164,65 @@ export class Orchestrator {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+
+    this.inFlightPlanning = this.runPlanning(next).finally(() => {
+      delete this.inFlightPlanning;
+    });
   }
+
+  private async runPlanning(issue: PlaneIssue): Promise<void> {
+    try {
+      const result = await this.planner.plan(issue);
+      this.logger.info(
+        {
+          workItemId: issue.id,
+          sequenceId: issue.sequenceId,
+          branch: result.branch,
+          phases: result.phaseTitles.length,
+          headSha: result.headSha.slice(0, 12),
+        },
+        "planning complete",
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error(
+        {
+          err,
+          workItemId: issue.id,
+          sequenceId: issue.sequenceId,
+        },
+        "planning failed",
+      );
+      this.store.markPlanningFailed(issue.id, message);
+      this.store.recordEvent(issue.id, "planning_failed", {
+        error: message,
+        details: err instanceof PlanningError ? {
+          worktreePath: err.details.worktreePath,
+          branch: err.details.branch,
+        } : undefined,
+      });
+      try {
+        await this.plane.postComment(
+          issue.id,
+          `<p><strong>Planning failed.</strong></p><pre>${escapeHtml(message)}</pre>`,
+        );
+      } catch (commentErr) {
+        this.logger.error(
+          { err: commentErr, workItemId: issue.id },
+          "failed to post planning failure comment",
+        );
+      }
+    }
+  }
+}
+
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // FIFO tiebreak uses Plane's updated_at as a proxy for "moved to In Progress".

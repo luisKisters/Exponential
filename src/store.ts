@@ -34,6 +34,10 @@ export interface IssueRow {
   picked_up_at: string;
   updated_at: string;
   attempts: number;
+  branch_name: string | null;
+  worktree_path: string | null;
+  plan_path: string | null;
+  last_error: string | null;
 }
 
 export interface PickupInsert {
@@ -86,6 +90,29 @@ export class Store {
 
       CREATE INDEX IF NOT EXISTS idx_events_work_item ON events(plane_work_item_id);
     `);
+
+    // Phase 2 columns. ALTER TABLE ADD COLUMN is a no-op-on-error so we just
+    // ignore "duplicate column" errors when the columns already exist.
+    const phase2Columns = [
+      "branch_name TEXT",
+      "worktree_path TEXT",
+      "plan_path TEXT",
+      "last_error TEXT",
+    ];
+    for (const col of phase2Columns) {
+      try {
+        this.db.exec(`ALTER TABLE issues ADD COLUMN ${col}`);
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          /duplicate column name/i.test(err.message)
+        ) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
     this.logger.debug("sqlite schema ensured");
   }
 
@@ -176,6 +203,47 @@ export class Store {
       details ? JSON.stringify(details) : null,
       new Date().toISOString(),
     );
+  }
+
+  markPlanning(
+    workItemId: string,
+    input: { branch: string; worktreePath: string },
+  ): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'planning',
+             branch_name = ?,
+             worktree_path = ?,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(input.branch, input.worktreePath, now, workItemId);
+  }
+
+  markPlanned(workItemId: string, planPath: string): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'planned',
+             plan_path = ?,
+             last_error = NULL,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(planPath, now, workItemId);
+  }
+
+  markPlanningFailed(workItemId: string, error: string): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'failed',
+             last_error = ?,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(error, now, workItemId);
   }
 
   close(): void {

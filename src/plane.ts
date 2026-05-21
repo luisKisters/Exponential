@@ -27,6 +27,11 @@ export interface PlaneIssue {
   projectId: string;
 }
 
+export interface PlaneIssueDetail extends PlaneIssue {
+  descriptionHtml: string;
+  descriptionText: string;
+}
+
 export class PlaneApi {
   private readonly client: PlaneClient;
 
@@ -88,6 +93,19 @@ export class PlaneApi {
     }
 
     return issues;
+  }
+
+  async retrieveIssue(workItemId: string): Promise<PlaneIssueDetail> {
+    const item = await this.client.workItems.retrieve(
+      this.workspaceSlug,
+      this.projectId,
+      workItemId,
+    );
+    return {
+      ...toPlaneIssue(item),
+      descriptionHtml: item.description_html ?? "",
+      descriptionText: item.description_stripped ?? "",
+    };
   }
 
   async postComment(workItemId: string, html: string): Promise<void> {

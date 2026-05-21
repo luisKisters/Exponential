@@ -148,3 +148,7 @@ data/
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
+
+# Per-issue worktrees (Phase 2+). The orchestrator creates these as git
+# worktrees of the summario repo; we never want them tracked in this repo.
+workspaces/

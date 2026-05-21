@@ -6,6 +6,17 @@ export interface Config {
     projectId: string;
     inProgressStatus: string;
   };
+  summario: {
+    repoPath: string;
+    worktreeBasePath: string;
+    defaultBranch: string;
+    remoteName: string;
+  };
+  claude: {
+    binary: string;
+    timeoutMs: number;
+    extraArgs: string[];
+  };
   pollIntervalMs: number;
   databasePath: string;
   logLevel: string;
@@ -42,6 +53,19 @@ export function loadConfig(): Config {
       workspaceSlug: required("PLANE_WORKSPACE_SLUG"),
       projectId: required("PLANE_PROJECT_ID"),
       inProgressStatus: optional("PLANE_IN_PROGRESS_STATUS", "In Progress"),
+    },
+    summario: {
+      repoPath: required("SUMMARIO_REPO_PATH"),
+      worktreeBasePath: optional("WORKTREE_BASE_PATH", "./workspaces"),
+      defaultBranch: optional("SUMMARIO_DEFAULT_BRANCH", "main"),
+      remoteName: optional("SUMMARIO_REMOTE_NAME", "origin"),
+    },
+    claude: {
+      binary: optional("CLAUDE_BINARY", "claude"),
+      timeoutMs: int("CLAUDE_TIMEOUT_MS", 30 * 60_000),
+      extraArgs: optional("CLAUDE_EXTRA_ARGS", "")
+        .split(/\s+/)
+        .filter((s) => s.length > 0),
     },
     pollIntervalMs: int("POLL_INTERVAL_MS", 30_000),
     databasePath: optional("DATABASE_PATH", "./data/exponential.sqlite"),
