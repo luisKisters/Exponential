@@ -5,9 +5,17 @@ import { ClaudeSession } from "./claude.js";
 import type { Config } from "./config.js";
 import { buildBranchName, buildWorktreePath, Git } from "./git.js";
 import type { Logger } from "./logger.js";
+import { injectPlanFence } from "./planeDescription.js";
 import type { PlaneApi, PlaneIssue } from "./plane.js";
 import { buildPlanningPrompt } from "./prompts/planning.js";
 import type { Store } from "./store.js";
+
+export interface PlanOptions {
+  /** 1-indexed pipeline loop number. 1 = fresh plan, 2+ = revision. */
+  loopNumber?: number;
+  /** Notes from prior E2E failures, fed to the planning prompt as revision context. */
+  priorFailures?: string;
+}
 
 export interface PlanResult {
   branch: string;
@@ -40,7 +48,7 @@ export class Planner {
    * Run the planning workflow for an issue. Throws on failure; the caller is
    * responsible for updating store + Plane on the failure path.
    */
-  async plan(issue: PlaneIssue): Promise<PlanResult> {
+  async plan(issue: PlaneIssue, opts: PlanOptions = {}): Promise<PlanResult> {
     const detail = await this.plane.retrieveIssue(issue.id);
 
     const branch = buildBranchName(issue.sequenceId, issue.name);
@@ -103,6 +111,8 @@ export class Planner {
       doneFlagRelPath,
       progressRelPath,
       branch,
+      loopNumber: opts.loopNumber ?? 1,
+      priorFailures: opts.priorFailures ?? "",
     });
 
     this.store.recordEvent(issue.id, "claude_session_started", {
@@ -183,6 +193,26 @@ export class Planner {
       phases: phaseTitles.length,
     });
 
+    // Inject the plan into the Plane description fence. This makes the
+    // revised plan visible above the comment stream — important after retries
+    // (Phase 4 loops back here with a revised plan).
+    try {
+      const refreshed = await this.plane.retrieveIssue(issue.id);
+      const newHtml = injectPlanFence(refreshed.descriptionHtml ?? "", planMarkdown);
+      await this.plane.updateDescriptionHtml(issue.id, newHtml);
+      this.store.recordEvent(issue.id, "plan_fence_synced", {
+        loopNumber: opts.loopNumber ?? 1,
+      });
+    } catch (err) {
+      this.logger.warn(
+        { err, workItemId: issue.id },
+        "failed to sync plan into Plane description (continuing)",
+      );
+      this.store.recordEvent(issue.id, "plan_fence_sync_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     await this.plane.postComment(
       issue.id,
       buildPlanCommentHtml({
@@ -190,6 +220,7 @@ export class Planner {
         phaseTitles,
         planRelPath: planPathRecord,
         headSha,
+        loopNumber: opts.loopNumber ?? 1,
       }),
     );
 
@@ -250,11 +281,15 @@ function buildPlanCommentHtml(input: {
   phaseTitles: string[];
   planRelPath: string;
   headSha: string;
+  loopNumber: number;
 }): string {
   const items = input.phaseTitles
     .map((title, i) => `<li>Phase ${i + 1}: ${escapeHtml(title)}</li>`)
     .join("");
-  return `<p><strong>Planning complete.</strong></p>
+  const heading = input.loopNumber > 1
+    ? `<p><strong>Planning revised (loop ${input.loopNumber}).</strong></p>`
+    : `<p><strong>Planning complete.</strong></p>`;
+  return `${heading}
 <p>Branch: <code>${escapeHtml(input.branch)}</code><br>Plan: <code>${escapeHtml(input.planRelPath)}</code><br>Commit: <code>${escapeHtml(input.headSha.slice(0, 12))}</code></p>
 <ol>${items}</ol>`;
 }

@@ -38,6 +38,10 @@ export interface IssueRow {
   worktree_path: string | null;
   plan_path: string | null;
   last_error: string | null;
+  summary_path: string | null;
+  head_sha: string | null;
+  loops: number;
+  preview_url: string | null;
 }
 
 export interface PickupInsert {
@@ -91,15 +95,19 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_events_work_item ON events(plane_work_item_id);
     `);
 
-    // Phase 2 columns. ALTER TABLE ADD COLUMN is a no-op-on-error so we just
-    // ignore "duplicate column" errors when the columns already exist.
-    const phase2Columns = [
+    // Phase 2 + 3 columns. ALTER TABLE ADD COLUMN is a no-op-on-error so we
+    // just ignore "duplicate column" errors when the columns already exist.
+    const extraColumns = [
       "branch_name TEXT",
       "worktree_path TEXT",
       "plan_path TEXT",
       "last_error TEXT",
+      "summary_path TEXT",
+      "head_sha TEXT",
+      "loops INTEGER NOT NULL DEFAULT 0",
+      "preview_url TEXT",
     ];
-    for (const col of phase2Columns) {
+    for (const col of extraColumns) {
       try {
         this.db.exec(`ALTER TABLE issues ADD COLUMN ${col}`);
       } catch (err) {
@@ -124,6 +132,30 @@ export class Store {
       `SELECT * FROM issues WHERE status NOT IN (${placeholders}) LIMIT 1`,
     );
     return stmt.get(...TERMINAL_STATUSES) as IssueRow | undefined;
+  }
+
+  /**
+   * Find an issue whose row was left in a resumable state (`planned` or
+   * `built`) — typically because the orchestrator crashed/restarted between
+   * stages. Returns the next stage to resume from.
+   */
+  findResumableIssue(): { row: IssueRow; resumeFrom: "build" | "e2e" } | undefined {
+    const planned = this.db.prepare(
+      `SELECT * FROM issues WHERE status = 'planned' LIMIT 1`,
+    ).get() as IssueRow | undefined;
+    if (planned) return { row: planned, resumeFrom: "build" };
+    const built = this.db.prepare(
+      `SELECT * FROM issues WHERE status = 'built' LIMIT 1`,
+    ).get() as IssueRow | undefined;
+    if (built) return { row: built, resumeFrom: "e2e" };
+    return undefined;
+  }
+
+  /** Back-compat alias. */
+  findPlannedIssue(): IssueRow | undefined {
+    return this.db.prepare(
+      `SELECT * FROM issues WHERE status = 'planned' LIMIT 1`,
+    ).get() as IssueRow | undefined;
   }
 
   getIssue(workItemId: string): IssueRow | undefined {
@@ -232,6 +264,109 @@ export class Store {
        WHERE plane_work_item_id = ?`,
     );
     stmt.run(planPath, now, workItemId);
+  }
+
+  markBuilding(workItemId: string): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'building',
+             last_error = NULL,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(now, workItemId);
+  }
+
+  markBuilt(
+    workItemId: string,
+    input: { summaryPath: string; headSha: string | null },
+  ): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'built',
+             summary_path = ?,
+             head_sha = ?,
+             last_error = NULL,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(input.summaryPath, input.headSha, now, workItemId);
+  }
+
+  markBuildFailed(workItemId: string, error: string): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'failed',
+             last_error = ?,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(error, now, workItemId);
+  }
+
+  markE2eTesting(
+    workItemId: string,
+    input: { previewUrl: string; loop: number },
+  ): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'e2e_testing',
+             preview_url = ?,
+             loops = ?,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(input.previewUrl, input.loop, now, workItemId);
+  }
+
+  markHumanReview(
+    workItemId: string,
+    input: { previewUrl: string | null },
+  ): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'human_review',
+             preview_url = COALESCE(?, preview_url),
+             last_error = NULL,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(input.previewUrl, now, workItemId);
+  }
+
+  markFailed(workItemId: string, error: string): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'failed',
+             last_error = ?,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(error, now, workItemId);
+  }
+
+  /**
+   * Reset an issue back to 'planning' for the next pipeline loop. Keeps the
+   * branch/worktree/plan_path so the planning agent can revise the existing
+   * plan rather than starting from scratch.
+   */
+  resetForLoop(workItemId: string, loop: number): void {
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET status = 'picked_up',
+             loops = ?,
+             last_error = NULL,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(loop, now, workItemId);
   }
 
   markPlanningFailed(workItemId: string, error: string): void {

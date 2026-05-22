@@ -92,8 +92,16 @@ export class Git {
 
   /**
    * Create a worktree at `path` checked out on a new branch `branch` based on
-   * `remote/baseBranch`. If the worktree already exists at that path, it is
-   * removed first. If the branch already exists locally, we reuse it.
+   * `remote/baseBranch`.
+   *
+   * Semantics, in order of preference:
+   *   1. If the worktree already exists at `path` AND is on `branch`, no-op.
+   *      This matters for Phase 4 retry loops — we re-use the implementation
+   *      worktree across plan revisions instead of nuking it every loop.
+   *   2. If the worktree exists at `path` but on a different branch, remove
+   *      and recreate.
+   *   3. If the branch already exists locally, attach the worktree to it.
+   *   4. Otherwise create a fresh branch from `remote/baseBranch`.
    */
   async addWorktree(
     path: string,
@@ -103,12 +111,30 @@ export class Git {
   ): Promise<void> {
     await mkdir(dirname(path), { recursive: true });
 
-    // Remove any pre-existing worktree at this path.
     if (existsSync(path)) {
-      this.logger.warn(
-        { path },
-        "worktree path already exists, removing before recreate",
-      );
+      try {
+        const current = await this.run(path, [
+          "rev-parse",
+          "--abbrev-ref",
+          "HEAD",
+        ]);
+        if (current.stdout.trim() === branch) {
+          this.logger.debug(
+            { path, branch },
+            "worktree already on target branch, reusing",
+          );
+          return;
+        }
+        this.logger.warn(
+          { path, branch, currentBranch: current.stdout.trim() },
+          "worktree path exists on a different branch, recreating",
+        );
+      } catch (err) {
+        this.logger.warn(
+          { err, path },
+          "could not determine current branch of existing worktree; recreating",
+        );
+      }
       try {
         await this.run(this.repoPath, [
           "worktree",
@@ -117,10 +143,9 @@ export class Git {
           path,
         ]);
       } catch (err) {
-        // Worktree might not be registered; fall back to manual cleanup.
         this.logger.warn(
           { err, path },
-          "git worktree remove failed, pruning + removing manually",
+          "git worktree remove failed, pruning + recreating",
         );
       }
       await this.run(this.repoPath, ["worktree", "prune"]);
@@ -187,6 +212,12 @@ export class Git {
    */
   async headSha(worktreePath: string): Promise<string> {
     const res = await this.run(worktreePath, ["rev-parse", "HEAD"]);
+    return res.stdout.trim();
+  }
+
+  /** Read the URL of a remote in the main repo. */
+  async getRemoteUrl(remote: string): Promise<string> {
+    const res = await this.run(this.repoPath, ["remote", "get-url", remote]);
     return res.stdout.trim();
   }
 

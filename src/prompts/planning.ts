@@ -17,6 +17,10 @@ export interface PlanningPromptInput {
   progressRelPath: string;
   /** Branch name the worktree is checked out on. */
   branch: string;
+  /** 1-indexed pipeline loop number. 1 = first plan, 2+ = revision after E2E failure. */
+  loopNumber?: number;
+  /** Notes from prior E2E failures (used when re-planning). */
+  priorFailures?: string;
 }
 
 export function buildPlanningPrompt(input: PlanningPromptInput): string {
@@ -28,13 +32,19 @@ export function buildPlanningPrompt(input: PlanningPromptInput): string {
     doneFlagRelPath,
     progressRelPath,
     branch,
+    loopNumber = 1,
+    priorFailures = "",
   } = input;
 
   const description = descriptionText.trim().length > 0
     ? descriptionText.trim()
     : "(no description provided)";
 
-  return `You are the **Planning Agent** for the Exponential autonomous coding pipeline. You are running inside a fresh git worktree of the summario repo, checked out on the branch \`${branch}\`.
+  const revisionBlock = priorFailures.trim().length > 0
+    ? `\n# This is a revision (loop ${loopNumber})\n\nThe previous plan was built and reached E2E, but E2E failed for the reasons below. Read this carefully and revise the plan to address it — don't just re-emit the same phases.\n\n${priorFailures.trim()}\n`
+    : "";
+
+  return `You are the **Planning Agent** for the Exponential autonomous coding pipeline. You are running inside a fresh git worktree of the summario repo, checked out on the branch \`${branch}\`.${revisionBlock}
 
 # Your task
 
@@ -60,6 +70,7 @@ ${description}
    - End with a concrete browser-observable behavior the user can verify.
    - Specify what files / modules are likely to change (best-effort, not binding).
    - Include a **Browser acceptance check** written in natural language that describes the *intent* of what to verify, not exact selectors or strict click-by-click instructions. The Building Agent and E2E Agent should both be able to follow it loosely.
+   - Include a **Satisfies AC** line listing the 1-indexed bullet numbers from the issue's \`## Acceptance Criteria\` section that this phase, once green, demonstrably satisfies. Use \`none\` if the phase doesn't tick any AC (e.g. a refactor-only phase). If the issue has no \`## Acceptance Criteria\` section, use \`none\` for every phase. Do NOT invent AC numbers that don't exist.
 
 # Output
 
@@ -83,6 +94,8 @@ Anything you couldn't fully resolve from the codebase / issue. The Building Agen
 **Likely changes:**
 - file or area
 - file or area
+
+**Satisfies AC:** 1, 2   <!-- or \`none\` -->
 
 **Browser acceptance check:**
 What a person opening the preview should be able to do/see to know this phase is working. Describe intent, not exact steps.
