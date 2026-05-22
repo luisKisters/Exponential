@@ -170,26 +170,28 @@ Scaffold the project and get it polling Plane.
 
 ---
 
-### Phase 2: Planning Agent
+### Phase 2: Planning Agent ✅
 
 Wire the planning agent into the orchestrator.
 
-**What to build:**
-- Planning agent system prompt template: instructs Claude Code to read the issue, read project memory files, use Context7 for library docs, and output a phased plan
-- Orchestrator integration: spawn Claude Code CLI (`claude --dangerously-skip-permissions -p "<prompt>"` or equivalent non-interactive mode), capture stdout
-- Clone/checkout summario repo if not already present, create feature branch `agent/PLANE-{id}-{short-title}`
-- Write the plan to `.agent/issues/PLANE-{id}/plan.md` on the branch
-- Commit the plan file
-- Post plan summary as a Plane comment (abbreviated — just phase titles and one-line descriptions)
-- Mark planning as complete in SQLite state
+**What was built:**
+- Planning agent prompt template (`src/prompts/planning.ts`): instructs Claude Code to read AGENTS.md / CLAUDE.md / docs/, skim relevant source, use `ctx7` for library docs, and output a phased plan with browser-observable acceptance checks per phase.
+- Orchestrator integration: spawn the Claude Code CLI **interactively** via `node-pty` (`src/claude.ts`). `claude -p` was avoided because it hits Max-plan rate limits; the prompt is passed as a positional CLI argument (initial user message), and the agent signals completion by writing `.agent/issues/<id>/done.flag`, which the orchestrator polls for. On detection, `/exit\r` is written to the pty, with SIGTERM (15 s) and SIGKILL (25 s) as fallbacks.
+- Required env var `SUMMARIO_REPO_PATH` points at an existing local clone of summario (for local dev this is a symlink to a working dev clone so `.env`/`node_modules` come along; for Phase 5 it will be a Docker volume).
+- For each pickup: `git fetch`, then `git worktree add <WORKTREE_BASE_PATH>/PLANE-<seq>/ -b agent/PLANE-<seq>-<slug> origin/main`. Phase 3 will reuse the same worktree path.
+- After the agent finishes: orchestrator removes `done.flag`, runs `git commit -am "chore(plan): …"`, then `git push -u origin agent/PLANE-<seq>-<slug>`.
+- Posts a Plane comment listing the phase titles, branch, plan path, and commit sha.
+- SQLite gains `branch_name`, `worktree_path`, `plan_path`, `last_error` columns plus `markPlanning` / `markPlanned` / `markPlanningFailed` transitions.
 
 **Acceptance test:**
 - Create an issue with goal + acceptance criteria + browser verification
 - Move to "In Progress"
 - Orchestrator picks it up, spawns planning agent
-- Feature branch exists with `plan.md` containing multiple phases
+- Feature branch exists on the remote with `plan.md` containing multiple phases
 - Each phase has: title, what to implement, browser acceptance check in natural language
 - Plane comment shows the plan summary
+
+**Permission mode:** the Claude session is spawned with `--permission-mode bypassPermissions` by default (overridable via `CLAUDE_EXTRA_ARGS`), because the unattended pty has nobody to answer the TUI's y/n approval prompts.
 
 ---
 
@@ -284,6 +286,49 @@ Deploy the orchestrator to the server via Coolify.
 
 ---
 
+## Verification surface
+
+Most acceptance criteria can be confirmed with **terminal commands + the Plane API + the orchestrator's structured logs**. `gh`, `git`, `curl`, `sqlite3`, `ls`, `cat`, `ps` cover the rest. The things that genuinely cannot be verified that way are listed per phase below.
+
+### Phase 1 — Orchestrator Core
+
+Everything is terminal-testable. Pickup order, the SQLite row, the pickup comment, the "skip when busy" branch, and graceful shutdown all surface in logs or `sqlite3 data/exponential.sqlite "…"`.
+
+**Not terminal-testable:** _(none)_
+
+### Phase 2 — Planning Agent
+
+The pipeline is observable end-to-end: orchestrator logs → worktree on disk → `plan.md` file → git history → GitHub branch (via `gh api`) → Plane comment.
+
+**Not terminal-testable:**
+- **Plan quality.** Whether the phase decomposition is sane, the acceptance checks are meaningful, and the agent actually consulted `AGENTS.md` / `docs/` / `ctx7` rather than hallucinating. Requires human reading of `plan.md`.
+- **Claude TUI scrollback.** Internal tool calls (`Bash`, `Read`, `Glob`, `Write`, `ctx7`) happen inside the pty and are not logged by us — only the bounded transcript is kept, and only on failure. To audit what the agent actually did, attach to the pty (not currently supported) or instrument the agent prompt to log its actions.
+
+### Phase 3 — Building Agent
+
+`pnpm typecheck` / `pnpm build` pass-fail, `git diff`, `git log`, dev-server port reachability via `curl`, branch push, Vercel deployment status via `gh api repos/.../commits/<sha>/check-runs` — all terminal.
+
+**Not terminal-testable:**
+- **Whether the building agent's per-phase browser checks actually verified the intent of the phase**, vs. were rubber-stamped. The agent reports success/failure, but the underlying browser interaction is inside the Claude TUI. Same instrumentation gap as Phase 2.
+- **Code quality** (readability, maintainability, idiomatic fit). Requires human review of the diff.
+
+### Phase 4 — E2E Agent + Full Pipeline
+
+Verdict (pass/fail), retry-loop transitions, terminal-state writes (`Human Review` / `Failed`), and full Plane comment history are all in logs + SQLite + Plane.
+
+**Not terminal-testable:**
+- **Visual rendering of the Vercel preview.** `curl` can fetch the HTML and confirm a 200, but cannot confirm "the tooltip actually shows up" or "the layout isn't broken" — that's what the E2E agent does inside its own browser tool, and that browser instance is not surfaced back to us. A human or screen-recording would be needed to fully replay it.
+- **Whether the E2E agent's verdict matches the user's intent**, beyond the structured acceptance checks. Same review gap as plan quality.
+
+### Phase 5 — Deployment
+
+`docker ps`, `docker stats`, `docker inspect`, `gh api` for branch protection, Coolify's own HTTP API — all terminal.
+
+**Not terminal-testable:**
+- **Coolify dashboard ergonomics** (does the service look right in the UI). Functionally redundant — the API tells us the same thing — but the user-facing dashboard is the only way to confirm what an operator would see.
+
+---
+
 ## Out of scope
 
 - Telegram intake bot
@@ -300,12 +345,15 @@ Deploy the orchestrator to the server via Coolify.
 ## Open questions
 
 1. **Agent-browser headless on server** — confirm it runs headless without a display. May need `--headless` flag or Xvfb.
-2. **Claude Code CLI non-interactive flags** — exact invocation for non-interactive mode with full tool access. Likely `claude -p "prompt" --dangerously-skip-permissions` but need to verify.
-3. **Worktree + Convex dev** — does `pnpm dev` (which runs both Next.js and Convex) work from a git worktree? May need `npx convex dev --once` or point to the main Convex deployment.
+2. **Worktree + Convex dev** — does `pnpm dev` (which runs both Next.js and Convex) work from a git worktree? May need `npx convex dev --once` or point to the main Convex deployment.
+3. **Recovery on restart** — if the orchestrator dies mid-planning, the SQLite row stays in `planning` and `hasActiveIssue` blocks new pickups indefinitely. Currently requires manual SQL fix. Decide a recovery policy (auto-fail rows older than X minutes? Re-run? Surface in logs?) before Phase 5.
 
 ## Resolved decisions
 
-- **Rate limits:** use exponential backoff when Claude Code hits limits. No pre-sizing needed.
+- **Rate limits:** `claude -p` is rate-limited on the Max plan, so Phase 2+ drives an **interactive** `claude` session via `node-pty`. Completion is signalled by the agent writing a `done.flag` file; the orchestrator then sends `/exit\r` (with SIGTERM/SIGKILL fallbacks).
+- **Claude Code permissions:** automated sessions need `--permission-mode bypassPermissions` (or `dontAsk`); the default mode prompts in the TUI and will hang with no human to confirm.
 - **Priority:** Plane priority field is configured and active. Queue sorts Urgent > High > Medium > Low > None.
-- **Worktree path:** `/workspaces/PLANE-{id}/` confirmed.
+- **Worktree path:** `<WORKTREE_BASE_PATH>/PLANE-<sequenceId>/` (default `./workspaces/`, overridable to `/workspaces/` in Docker). The same worktree is reused by Phase 3.
+- **Summario clone:** for local dev, point `SUMMARIO_REPO_PATH` at the existing dev clone (or a symlink) so `.env` / `node_modules` come along free; for Phase 5, mount via Docker volume. No cloning-from-URL step needed for now.
+- **Push timing:** the planning agent's branch is pushed at the end of Phase 2 (not deferred to Phase 3) so it appears on GitHub immediately for visibility.
 - **Poll interval:** 30s default.

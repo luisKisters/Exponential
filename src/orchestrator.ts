@@ -105,13 +105,12 @@ export class Orchestrator {
 
     const fresh = candidates.filter((issue) => {
       const row = this.store.getIssue(issue.id);
-      // Pick if never seen, or only seen in a terminal state previously.
-      return (
-        !row ||
-        row.status === "human_review" ||
-        row.status === "failed" ||
-        row.status === "done"
-      );
+      // Only pick truly new issues. Anything we've ever seen — including
+      // 'failed', 'human_review', and 'done' — stays alone until the user
+      // explicitly clears the SQLite row (or, later, an external state machine
+      // signals retry). Without this guard a failed planning run would loop
+      // forever, since Plane still has the issue in "In Progress".
+      return !row;
     });
 
     if (fresh.length === 0) {

@@ -11,7 +11,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "start": "node --env-file-if-exists=.env dist/index.js",
-    "dev": "node --env-file-if-exists=.env --watch --enable-source-maps --import tsx src/index.ts"
+    "dev": "node --env-file-if-exists=.env --watch --enable-source-maps --import tsx src/index.ts",
+    "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true"
   },
   "dependencies": {
     "@makeplane/plane-node-sdk": "^0.2.11",

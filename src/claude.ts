@@ -50,7 +50,19 @@ export class ClaudeSession {
       env,
     } = options;
 
-    const args = [...extraArgs, prompt];
+    // Default permission mode for unattended runs. The TUI shows a y/n prompt
+    // for every tool call in `default` mode and there is no human at the pty
+    // to answer, so the session would hang on the first Bash/Write/Edit. Skip
+    // the default only if the caller already set --permission-mode in
+    // extraArgs (e.g. via CLAUDE_EXTRA_ARGS).
+    const hasExplicitPermissionMode = extraArgs.some(
+      (a) => a === "--permission-mode" || a.startsWith("--permission-mode="),
+    );
+    const defaultedArgs = hasExplicitPermissionMode
+      ? extraArgs
+      : ["--permission-mode", "bypassPermissions", ...extraArgs];
+
+    const args = [...defaultedArgs, prompt];
 
     this.logger.info(
       {
