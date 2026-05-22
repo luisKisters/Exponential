@@ -5,21 +5,36 @@ import type { Config } from "./config.js";
 import { E2eRunner, type E2eResult } from "./e2e.js";
 import { Git } from "./git.js";
 import type { Logger } from "./logger.js";
-import { PRIORITY_RANK, type PlaneApi, type PlaneIssue } from "./plane.js";
-import { Planner, PlanningError, type PlanResult } from "./planner.js";
+import { PRIORITY_RANK, type PlaneApi, type PlaneComment, type PlaneIssue } from "./plane.js";
+import {
+  Planner,
+  PlanningAbortedError,
+  PlanningError,
+  type PlanResult,
+} from "./planner.js";
 import type { IssueRow, Store } from "./store.js";
 import { deriveGhRepo, waitForPreview } from "./vercel.js";
 
+type StageOutcome<T> =
+  | { ok: true; aborted: false; result: T }
+  | { ok: false; aborted: true }
+  | { ok: false; aborted: false; reason: string };
+
 export class Orchestrator {
   private timer?: NodeJS.Timeout;
+  private feedbackTimer?: NodeJS.Timeout;
   private inFlightCycle = false;
+  private inFlightFeedbackTick = false;
   private inFlightPipeline?: Promise<void>;
+  private inFlightIssueId: string | null = null;
   private stopped = false;
   private inProgressStateId: string | undefined;
   private humanReviewStateId: string | undefined;
   private failedStateId: string | undefined;
   private ghRepo: string | undefined;
   private resolveStop?: () => void;
+  /** Active per-stage abort controllers keyed by work-item-id. Multiple per issue is allowed during transitions. */
+  private readonly stageAborters = new Map<string, Set<AbortController>>();
   private readonly planner: Planner;
   private readonly builder: Builder;
   private readonly e2e: E2eRunner;
@@ -69,6 +84,13 @@ export class Orchestrator {
     this.timer = setInterval(() => {
       void this.runCycle();
     }, this.config.pollIntervalMs);
+
+    // Comment polling is a separate, faster cadence so reviewer interrupts
+    // don't have to wait a full poll interval.
+    void this.runFeedbackTick();
+    this.feedbackTimer = setInterval(() => {
+      void this.runFeedbackTick();
+    }, this.config.commentPollIntervalMs);
   }
 
   async stop(): Promise<void> {
@@ -77,6 +99,10 @@ export class Orchestrator {
     if (this.timer) {
       clearInterval(this.timer);
       delete this.timer;
+    }
+    if (this.feedbackTimer) {
+      clearInterval(this.feedbackTimer);
+      delete this.feedbackTimer;
     }
     if (this.inFlightCycle) {
       this.logger.info("waiting for in-flight poll cycle to finish");
@@ -179,7 +205,11 @@ export class Orchestrator {
     }
 
     try {
-      await this.plane.postComment(next.id, "<p>Picked up by Exponential.</p>");
+      const pickupComment = await this.plane.postComment(
+        next.id,
+        "<p>Picked up by Exponential.</p>",
+      );
+      this.store.advanceCommentWatermark(next.id, pickupComment.createdAt);
     } catch (err) {
       this.logger.error(
         { err, workItemId: next.id },
@@ -190,8 +220,27 @@ export class Orchestrator {
       });
     }
 
-    this.inFlightPipeline = this.runPipeline(next).finally(() => {
+    this.startPipeline(next);
+  }
+
+  /**
+   * Single entry point that wraps `runPipeline` in the in-flight bookkeeping
+   * the orchestrator relies on (`inFlightPipeline` promise + `inFlightIssueId`
+   * marker). Reused by `pollOnce`, `resumeOrphans`, and the feedback watcher's
+   * "reopen from human review" path.
+   */
+  private startPipeline(issue: PlaneIssue): void {
+    if (this.inFlightPipeline) {
+      this.logger.warn(
+        { workItemId: issue.id },
+        "refusing to start a pipeline while another is in flight",
+      );
+      return;
+    }
+    this.inFlightIssueId = issue.id;
+    this.inFlightPipeline = this.runPipeline(issue).finally(() => {
       delete this.inFlightPipeline;
+      this.inFlightIssueId = null;
     });
   }
 
@@ -245,10 +294,160 @@ export class Orchestrator {
       headSha: row.head_sha ?? "",
       phaseTitles: [],
     };
+    this.inFlightIssueId = issue.id;
     this.inFlightPipeline = this.continuePipeline(issue, planResult, resumeFrom)
       .finally(() => {
         delete this.inFlightPipeline;
+        this.inFlightIssueId = null;
       });
+  }
+
+  // ---------- comment / feedback watcher ----------
+
+  private async runFeedbackTick(): Promise<void> {
+    if (this.inFlightFeedbackTick || this.stopped) return;
+    this.inFlightFeedbackTick = true;
+    try {
+      await this.tickFeedback();
+    } catch (err) {
+      this.logger.error({ err }, "feedback tick failed");
+    } finally {
+      this.inFlightFeedbackTick = false;
+    }
+  }
+
+  private async tickFeedback(): Promise<void> {
+    const targets = this.store.listFeedbackTargets();
+    for (const row of targets) {
+      try {
+        await this.pollIssueForFeedback(row);
+      } catch (err) {
+        this.logger.warn(
+          { err, workItemId: row.plane_work_item_id },
+          "feedback poll failed for issue",
+        );
+      }
+    }
+  }
+
+  private async pollIssueForFeedback(row: IssueRow): Promise<void> {
+    const since = row.last_seen_comment_at;
+    const sinceMs = since ? Date.parse(since) : 0;
+
+    let comments: PlaneComment[];
+    try {
+      comments = await this.plane.listComments(row.plane_work_item_id);
+    } catch (err) {
+      this.logger.warn(
+        { err, workItemId: row.plane_work_item_id },
+        "could not list comments for feedback poll",
+      );
+      return;
+    }
+
+    const fresh = comments
+      .filter((c) => c.createdAt.getTime() > sinceMs)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    if (fresh.length === 0) return;
+
+    // Advance the watermark past these comments — whether or not we end up
+    // treating them as feedback, we never want to re-process the same comment
+    // twice.
+    const newest = fresh[fresh.length - 1]!;
+    this.store.advanceCommentWatermark(row.plane_work_item_id, newest.createdAt);
+
+    const meaningful = fresh
+      .map((c) => c.text.trim())
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+    if (meaningful.length === 0) return;
+
+    this.logger.info(
+      {
+        workItemId: row.plane_work_item_id,
+        sequenceId: row.sequence_id,
+        commentCount: fresh.length,
+        status: row.status,
+      },
+      "reviewer feedback detected",
+    );
+    this.store.appendPendingFeedback(row.plane_work_item_id, meaningful);
+    this.store.recordEvent(row.plane_work_item_id, "feedback_detected", {
+      commentIds: fresh.map((c) => c.id),
+      preview: meaningful.slice(0, 200),
+    });
+
+    // If the issue is mid-pipeline, abort the active stage so the loop catches
+    // up and re-plans with the feedback included.
+    const aborters = this.stageAborters.get(row.plane_work_item_id);
+    if (aborters && aborters.size > 0) {
+      this.logger.info(
+        { workItemId: row.plane_work_item_id, count: aborters.size },
+        "interrupting active claude session for reviewer feedback",
+      );
+      for (const ctrl of aborters) ctrl.abort();
+      this.store.recordEvent(
+        row.plane_work_item_id,
+        "session_aborted_for_feedback",
+        {},
+      );
+      return;
+    }
+
+    // Otherwise the issue is in `human_review` / `failed` (or a status with
+    // no active session — the pipeline crashed). Reopen it and kick off a
+    // fresh pipeline if nothing else is running.
+    if (this.inFlightPipeline) {
+      this.logger.info(
+        { workItemId: row.plane_work_item_id, activeIssueId: this.inFlightIssueId },
+        "another pipeline is in flight; feedback queued until it finishes",
+      );
+      return;
+    }
+    if (!row.branch_name || !row.worktree_path || !row.plan_path) {
+      this.logger.warn(
+        { workItemId: row.plane_work_item_id },
+        "feedback received but issue has no branch/worktree to reopen against; ignoring",
+      );
+      return;
+    }
+    if (!this.inProgressStateId) return;
+    this.store.reopenForFeedback(row.plane_work_item_id);
+    this.store.recordEvent(row.plane_work_item_id, "feedback_reopened", {
+      fromStatus: row.status,
+    });
+    const issue = issueFromRow(row, this.inProgressStateId);
+    this.startPipeline(issue);
+  }
+
+  // ---------- stage-abort registry ----------
+
+  /**
+   * Register an AbortController for the currently-executing Claude session
+   * stage. Returns the signal to pass into the stage runner and a release
+   * function that the caller MUST invoke (via try/finally) once the stage is
+   * done — otherwise the watcher will try to abort an already-finished pty.
+   */
+  private registerStageAbort(workItemId: string): {
+    signal: AbortSignal;
+    release: () => void;
+  } {
+    const ctrl = new AbortController();
+    let set = this.stageAborters.get(workItemId);
+    if (!set) {
+      set = new Set();
+      this.stageAborters.set(workItemId, set);
+    }
+    set.add(ctrl);
+    return {
+      signal: ctrl.signal,
+      release: () => {
+        const s = this.stageAborters.get(workItemId);
+        if (!s) return;
+        s.delete(ctrl);
+        if (s.size === 0) this.stageAborters.delete(workItemId);
+      },
+    };
   }
 
   /**
@@ -288,28 +487,41 @@ export class Orchestrator {
 
       if (stage === "plan") {
         if (loop > 1) this.store.resetForLoop(issue.id, loop);
-        planResult = await this.runPlanning(issue, {
+        priorFailures = this.foldInPendingFeedback(issue.id, priorFailures, loop);
+        const out = await this.runPlanning(issue, {
           loopNumber: loop,
           priorFailures,
         });
-        if (!planResult) return;
+        if (out.aborted) {
+          // Reviewer interrupted mid-plan. The watcher already wrote feedback
+          // to pending_feedback; the next iteration drains it via
+          // foldInPendingFeedback above. Do NOT advance the loop counter —
+          // it isn't an E2E failure, it's a steering correction.
+          stage = "plan";
+          continue;
+        }
+        if (!out.ok) return;
+        planResult = out.result;
         stage = "build";
       }
 
       if (stage === "build") {
         if (!planResult) return;
-        buildResult = await this.runBuilding(issue, planResult);
-        if (!buildResult || !buildResult.ok) {
+        const out = await this.runBuilding(issue, planResult);
+        if (out.aborted) {
+          stage = "plan";
+          continue;
+        }
+        if (!out.ok) {
           await this.finishPipeline(issue, "failed", {
-            reason: buildResult
-              ? `build did not complete cleanly after ${buildResult.attempts} attempt(s)`
-              : "building threw",
+            reason: out.reason ?? "build did not complete",
             previewUrl: null,
             planResult,
             loop,
           });
           return;
         }
+        buildResult = out.result;
         stage = "e2e";
       }
 
@@ -328,25 +540,59 @@ export class Orchestrator {
 
         const previewUrl = await this.waitForPreviewSafely(issue, sha);
         if (!previewUrl) {
-          await this.finishPipeline(issue, "failed", {
-            reason: "vercel preview was never available",
-            previewUrl: null,
-            planResult,
-            loop,
+          // Phase 5 (slice 5a): vercel preview is treated as a retriable
+          // resource. Each failure increments preview_retry_count, posts a
+          // comment, and we let the pipeline retry the e2e stage. Only after
+          // exhausting MAX_PREVIEW_RETRIES do we transition to Failed.
+          const retried = this.store.incrementPreviewRetry(issue.id);
+          this.store.recordEvent(issue.id, "preview_retry", {
+            attempt: retried,
+            cap: this.config.vercel.maxPreviewRetries,
+            sha,
           });
-          return;
+          if (retried >= this.config.vercel.maxPreviewRetries) {
+            await this.finishPipeline(issue, "failed", {
+              reason: `vercel preview failed ${retried} time(s)`,
+              previewUrl: null,
+              planResult,
+              loop,
+            });
+            return;
+          }
+          try {
+            const c = await this.plane.postComment(
+              issue.id,
+              `<p><strong>Vercel preview build failed</strong> (attempt ${retried}/${this.config.vercel.maxPreviewRetries}). Retrying.</p>`,
+            );
+            this.store.advanceCommentWatermark(issue.id, c.createdAt);
+          } catch {
+            // best-effort
+          }
+          // Brief pause so we don't hammer the GitHub API and so Vercel has a
+          // chance to (re)spin a new build.
+          await new Promise((r) => setTimeout(r, this.config.vercel.retryPauseMs));
+          // Stay on `e2e` stage; loop body will re-enter waitForPreviewSafely.
+          continue;
         }
 
-        const e2eResult = await this.runE2e(issue, planResult, previewUrl, loop, priorFailures);
-        if (!e2eResult) {
+        // Got a working preview — reset the retry counter for next time.
+        this.store.resetPreviewRetry(issue.id);
+
+        const out = await this.runE2e(issue, planResult, previewUrl, loop, priorFailures);
+        if (out.aborted) {
+          stage = "plan";
+          continue;
+        }
+        if (!out.ok) {
           await this.finishPipeline(issue, "failed", {
-            reason: "e2e session threw",
+            reason: out.reason ?? "e2e stage failed",
             previewUrl,
             planResult,
             loop,
           });
           return;
         }
+        const e2eResult = out.result;
 
         if (e2eResult.verdict === "e2e-passed") {
           await this.finishPipeline(issue, "human_review", {
@@ -387,14 +633,39 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Drain any reviewer feedback that arrived since the last loop iteration and
+   * prepend it to `priorFailures`. The planning prompt already routes
+   * priorFailures into a visible "this is a revision" block, so feedback
+   * piggybacks on that channel without a prompt-shape change.
+   */
+  private foldInPendingFeedback(
+    workItemId: string,
+    priorFailures: string,
+    loop: number,
+  ): string {
+    const feedback = this.store.takePendingFeedback(workItemId);
+    if (!feedback) return priorFailures;
+    this.store.recordEvent(workItemId, "feedback_consumed", {
+      loop,
+      preview: feedback.slice(0, 200),
+    });
+    const header = `## Reviewer feedback (Plane comments)\n\nA human reviewer left the following note(s) and wants the plan revised to address them. Do not ignore.\n\n${feedback.trim()}`;
+    return priorFailures.trim().length > 0
+      ? `${header}\n\n${priorFailures}`
+      : header;
+  }
+
   private async runPlanning(
     issue: PlaneIssue,
     opts: { loopNumber: number; priorFailures: string },
-  ): Promise<PlanResult | null> {
+  ): Promise<StageOutcome<PlanResult>> {
+    const stageAbort = this.registerStageAbort(issue.id);
     try {
       const result = await this.planner.plan(issue, {
         loopNumber: opts.loopNumber,
         priorFailures: opts.priorFailures,
+        signal: stageAbort.signal,
       });
       this.logger.info(
         {
@@ -407,8 +678,15 @@ export class Orchestrator {
         },
         "planning complete",
       );
-      return result;
+      return { ok: true, aborted: false, result };
     } catch (err) {
+      if (err instanceof PlanningAbortedError) {
+        this.logger.info(
+          { workItemId: issue.id, loop: opts.loopNumber },
+          "planning aborted for reviewer feedback",
+        );
+        return { ok: false, aborted: true };
+      }
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(
         { err, workItemId: issue.id, sequenceId: issue.sequenceId },
@@ -424,21 +702,25 @@ export class Orchestrator {
         } : undefined,
       });
       try {
-        await this.plane.postComment(
+        const c = await this.plane.postComment(
           issue.id,
           `<p><strong>Planning failed (loop ${opts.loopNumber}).</strong></p><pre>${escapeHtml(message)}</pre>`,
         );
+        this.store.advanceCommentWatermark(issue.id, c.createdAt);
       } catch {
         // best-effort
       }
-      return null;
+      return { ok: false, aborted: false, reason: message };
+    } finally {
+      stageAbort.release();
     }
   }
 
   private async runBuilding(
     issue: PlaneIssue,
     planResult: PlanResult,
-  ): Promise<BuildResult | null> {
+  ): Promise<StageOutcome<BuildResult>> {
+    const stageAbort = this.registerStageAbort(issue.id);
     try {
       const detail = await this.plane.retrieveIssue(issue.id);
       const result = await this.builder.build({
@@ -446,6 +728,7 @@ export class Orchestrator {
         branch: planResult.branch,
         worktreePath: planResult.worktreePath,
         planRelPath: planResult.planPath,
+        signal: stageAbort.signal,
       });
       this.logger.info(
         {
@@ -453,6 +736,7 @@ export class Orchestrator {
           sequenceId: issue.sequenceId,
           branch: planResult.branch,
           ok: result.ok,
+          aborted: result.aborted,
           attempts: result.attempts,
           headSha: result.headSha?.slice(0, 12) ?? null,
           phases: result.phases.length,
@@ -460,7 +744,17 @@ export class Orchestrator {
         },
         "build stage finished",
       );
-      return result;
+      if (result.aborted) {
+        return { ok: false, aborted: true };
+      }
+      if (!result.ok) {
+        return {
+          ok: false,
+          aborted: false,
+          reason: `build did not complete cleanly after ${result.attempts} attempt(s)`,
+        };
+      }
+      return { ok: true, aborted: false, result };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(
@@ -475,7 +769,9 @@ export class Orchestrator {
           branch: err.details.branch,
         } : undefined,
       });
-      return null;
+      return { ok: false, aborted: false, reason: message };
+    } finally {
+      stageAbort.release();
     }
   }
 
@@ -531,7 +827,8 @@ export class Orchestrator {
     previewUrl: string,
     loop: number,
     priorFailures: string,
-  ): Promise<E2eResult | null> {
+  ): Promise<StageOutcome<E2eResult>> {
+    const stageAbort = this.registerStageAbort(issue.id);
     try {
       const detail = await this.plane.retrieveIssue(issue.id);
       const result = await this.e2e.verify({
@@ -541,6 +838,7 @@ export class Orchestrator {
         previewUrl,
         loopNumber: loop,
         priorFailures,
+        signal: stageAbort.signal,
       });
       this.logger.info(
         {
@@ -549,16 +847,26 @@ export class Orchestrator {
           verdict: result.verdict,
           doneFlagSeen: result.doneFlagSeen,
           timedOut: result.timedOut,
+          aborted: result.aborted,
         },
         "e2e stage finished",
       );
-      return result;
+      if (result.aborted) {
+        return { ok: false, aborted: true };
+      }
+      return { ok: true, aborted: false, result };
     } catch (err) {
       this.logger.error({ err, workItemId: issue.id }, "e2e threw");
       this.store.recordEvent(issue.id, "e2e_threw", {
         error: err instanceof Error ? err.message : String(err),
       });
-      return null;
+      return {
+        ok: false,
+        aborted: false,
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      stageAbort.release();
     }
   }
 
@@ -615,10 +923,11 @@ export class Orchestrator {
     }
 
     try {
-      await this.plane.postComment(
+      const c = await this.plane.postComment(
         issue.id,
         buildFinalCommentHtml({ outcome, ...input }),
       );
+      this.store.advanceCommentWatermark(issue.id, c.createdAt);
     } catch (err) {
       this.logger.error(
         { err, workItemId: issue.id },

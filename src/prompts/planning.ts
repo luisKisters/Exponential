@@ -41,7 +41,7 @@ export function buildPlanningPrompt(input: PlanningPromptInput): string {
     : "(no description provided)";
 
   const revisionBlock = priorFailures.trim().length > 0
-    ? `\n# This is a revision (loop ${loopNumber})\n\nThe previous plan was built and reached E2E, but E2E failed for the reasons below. Read this carefully and revise the plan to address it — don't just re-emit the same phases.\n\n${priorFailures.trim()}\n`
+    ? `\n# Revise the plan to address the notes below\n\nThe notes may be reviewer feedback left on the Plane issue while the agent was working, an E2E failure from a prior loop, or both. Read every section carefully and revise the plan so the next build attempt addresses them — don't just re-emit the same phases. ${loopNumber > 1 ? `(Loop ${loopNumber}.)` : ""}\n\n${priorFailures.trim()}\n`
     : "";
 
   return `You are the **Planning Agent** for the Exponential autonomous coding pipeline. You are running inside a fresh git worktree of the summario repo, checked out on the branch \`${branch}\`.${revisionBlock}

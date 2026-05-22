@@ -34,6 +34,10 @@ export interface Config {
     protectionBypass: string | null;
     /** Max time to wait for a preview deployment to reach a terminal state. */
     readyTimeoutMs: number;
+    /** Phase 5 (slice 5a): hard cap on preview-build retries before failing. */
+    maxPreviewRetries: number;
+    /** How long to wait between preview-retry attempts. */
+    retryPauseMs: number;
   };
   e2e: {
     /** Hard timeout per E2E Claude session. */
@@ -48,6 +52,8 @@ export interface Config {
   /** Optional mock test user the E2E agent signs in with. */
   mockUser: { email: string; password: string } | null;
   pollIntervalMs: number;
+  /** Phase 4.5: how often to poll Plane comments for reviewer feedback. */
+  commentPollIntervalMs: number;
   databasePath: string;
   logLevel: string;
 }
@@ -119,6 +125,8 @@ export function loadConfig(): Config {
     vercel: {
       protectionBypass: optional("VERCEL_PROTECTION_BYPASS", "") || null,
       readyTimeoutMs: int("VERCEL_READY_TIMEOUT_MS", 10 * 60_000),
+      maxPreviewRetries: int("MAX_PREVIEW_RETRIES", 3),
+      retryPauseMs: int("VERCEL_RETRY_PAUSE_MS", 20_000),
     },
     e2e: {
       timeoutMs: int("E2E_TIMEOUT_MS", 20 * 60_000),
@@ -130,6 +138,7 @@ export function loadConfig(): Config {
     },
     mockUser,
     pollIntervalMs: int("POLL_INTERVAL_MS", 30_000),
+    commentPollIntervalMs: int("COMMENT_POLL_INTERVAL_MS", 10_000),
     databasePath: optional("DATABASE_PATH", "./data/exponential.sqlite"),
     logLevel: optional("LOG_LEVEL", "info"),
   };

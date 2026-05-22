@@ -17,6 +17,8 @@ export interface E2eInput {
   previewUrl: string;
   loopNumber: number;
   priorFailures: string;
+  /** Optional abort signal for reviewer-feedback interruption. */
+  signal?: AbortSignal;
 }
 
 export interface E2eResult {
@@ -29,6 +31,8 @@ export interface E2eResult {
   verdictRelPath: string;
   /** Path (repo-rel) to the failures notes (may not exist). */
   failuresRelPath: string;
+  /** True if the session was interrupted by reviewer feedback. */
+  aborted: boolean;
 }
 
 export class E2eRunner {
@@ -43,7 +47,7 @@ export class E2eRunner {
   }
 
   async verify(input: E2eInput): Promise<E2eResult> {
-    const { issue, branch, worktreePath, previewUrl, loopNumber, priorFailures } = input;
+    const { issue, branch, worktreePath, previewUrl, loopNumber, priorFailures, signal } = input;
 
     this.store.markE2eTesting(issue.id, { previewUrl, loop: loopNumber });
     this.store.recordEvent(issue.id, "e2e_started", {
@@ -95,6 +99,7 @@ export class E2eRunner {
       timeoutMs: this.config.e2e.timeoutMs,
       binary: this.config.claude.binary,
       extraArgs: this.config.claude.extraArgs,
+      signal,
     });
 
     this.store.recordEvent(issue.id, "e2e_session_finished", {
@@ -102,6 +107,7 @@ export class E2eRunner {
       signal: result.signal,
       doneFlagSeen: result.doneFlagSeen,
       timedOut: result.timedOut,
+      aborted: result.aborted,
       loop: loopNumber,
     });
 
@@ -118,6 +124,7 @@ export class E2eRunner {
       timedOut: result.timedOut,
       verdictRelPath: relative(worktreePath, verdictAbs),
       failuresRelPath: relative(worktreePath, failuresAbs),
+      aborted: result.aborted,
     };
   }
 }

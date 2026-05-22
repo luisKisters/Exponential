@@ -15,6 +15,8 @@ export interface PlanOptions {
   loopNumber?: number;
   /** Notes from prior E2E failures, fed to the planning prompt as revision context. */
   priorFailures?: string;
+  /** Optional abort signal for reviewer-feedback interruption. */
+  signal?: AbortSignal;
 }
 
 export interface PlanResult {
@@ -126,6 +128,7 @@ export class Planner {
       timeoutMs: this.config.claude.timeoutMs,
       binary: this.config.claude.binary,
       extraArgs: this.config.claude.extraArgs,
+      signal: opts.signal,
     });
 
     this.store.recordEvent(issue.id, "claude_session_finished", {
@@ -133,7 +136,15 @@ export class Planner {
       signal: result.signal,
       doneFlagSeen: result.doneFlagSeen,
       timedOut: result.timedOut,
+      aborted: result.aborted,
     });
+
+    if (result.aborted) {
+      throw new PlanningAbortedError(
+        "planning session aborted for reviewer feedback",
+        { worktreePath, branch, transcript: result.transcript },
+      );
+    }
 
     if (!result.doneFlagSeen) {
       const reason = result.timedOut
@@ -213,7 +224,7 @@ export class Planner {
       });
     }
 
-    await this.plane.postComment(
+    const planComment = await this.plane.postComment(
       issue.id,
       buildPlanCommentHtml({
         branch,
@@ -223,6 +234,7 @@ export class Planner {
         loopNumber: opts.loopNumber ?? 1,
       }),
     );
+    this.store.advanceCommentWatermark(issue.id, planComment.createdAt);
 
     return {
       branch,
@@ -245,6 +257,25 @@ export class PlanningError extends Error {
   ) {
     super(message);
     this.name = "PlanningError";
+  }
+}
+
+/**
+ * Thrown when the planning session was interrupted by reviewer feedback. The
+ * orchestrator treats this differently from PlanningError: it drains pending
+ * feedback and re-enters the planning stage with the comment text included.
+ */
+export class PlanningAbortedError extends Error {
+  constructor(
+    message: string,
+    public readonly details: {
+      worktreePath: string;
+      branch: string;
+      transcript: string;
+    },
+  ) {
+    super(message);
+    this.name = "PlanningAbortedError";
   }
 }
 

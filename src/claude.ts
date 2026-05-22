@@ -17,6 +17,12 @@ export interface ClaudeSessionOptions {
   extraArgs?: string[];
   /** Extra env merged into process.env when spawning. */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Optional abort signal. When it fires (orchestrator received reviewer
+   * feedback and wants to interrupt), we run the same /exit → SIGTERM → SIGKILL
+   * shutdown sequence as a normal completion and resolve with `aborted: true`.
+   */
+  signal?: AbortSignal | undefined;
 }
 
 export interface ClaudeSessionResult {
@@ -28,6 +34,8 @@ export interface ClaudeSessionResult {
   doneFlagSeen: boolean;
   /** True if the session was force-killed because of the timeout. */
   timedOut: boolean;
+  /** True if the session was interrupted via the abort signal. */
+  aborted: boolean;
 }
 
 export class ClaudeSession {
@@ -48,6 +56,7 @@ export class ClaudeSession {
       binary = "claude",
       extraArgs = [],
       env,
+      signal,
     } = options;
 
     // Default permission mode for unattended runs. The TUI shows a y/n prompt
@@ -90,11 +99,13 @@ export class ClaudeSession {
       transcript: string;
       doneFlagSeen: boolean;
       timedOut: boolean;
+      aborted: boolean;
       exit: { code: number | null; signal: number | null } | null;
     } = {
       transcript: "",
       doneFlagSeen: false,
       timedOut: false,
+      aborted: false,
       exit: null,
     };
 
@@ -121,9 +132,15 @@ export class ClaudeSession {
     const pollInterval = 500;
     const exitGracePeriodMs = 15_000;
 
+    let abortListener: (() => void) | null = null;
     await new Promise<void>((resolveFlag) => {
       const tick = (): void => {
         if (state.exit) {
+          resolveFlag();
+          return;
+        }
+        if (signal?.aborted && !state.aborted) {
+          state.aborted = true;
           resolveFlag();
           return;
         }
@@ -139,8 +156,18 @@ export class ClaudeSession {
         }
         setTimeout(tick, pollInterval);
       };
+      if (signal && !signal.aborted) {
+        abortListener = () => {
+          state.aborted = true;
+          resolveFlag();
+        };
+        signal.addEventListener("abort", abortListener, { once: true });
+      }
       tick();
     });
+    if (signal && abortListener) {
+      signal.removeEventListener("abort", abortListener);
+    }
 
     if (state.exit) {
       // Claude exited on its own before we saw the flag.
@@ -158,6 +185,7 @@ export class ClaudeSession {
         transcript: state.transcript,
         doneFlagSeen: state.doneFlagSeen,
         timedOut: false,
+        aborted: state.aborted,
       };
     }
 
@@ -170,6 +198,15 @@ export class ClaudeSession {
         child.write("/exit\r");
       } catch (err) {
         this.logger.warn({ err }, "failed to send /exit to claude pty");
+      }
+    } else if (state.aborted) {
+      this.logger.warn(
+        "claude session aborted by orchestrator (reviewer feedback)",
+      );
+      try {
+        child.write("/exit\r");
+      } catch (err) {
+        this.logger.warn({ err }, "failed to send /exit to claude pty during abort");
       }
     } else if (state.timedOut) {
       this.logger.error(
@@ -214,6 +251,7 @@ export class ClaudeSession {
       transcript: state.transcript,
       doneFlagSeen: state.doneFlagSeen,
       timedOut: state.timedOut,
+      aborted: state.aborted,
     };
   }
 }

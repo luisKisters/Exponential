@@ -32,6 +32,17 @@ export interface PlaneIssueDetail extends PlaneIssue {
   descriptionText: string;
 }
 
+export interface PlaneComment {
+  id: string;
+  createdAt: Date;
+  /** Plain-text body — Plane's own stripped version, or a fallback strip of the HTML. */
+  text: string;
+  /** Raw HTML, useful when we want to embed without re-rendering. */
+  html: string;
+  /** Plane user UUID of the comment author, when the API returns it. */
+  actor: string | null;
+}
+
 export class PlaneApi {
   private readonly client: PlaneClient;
 
@@ -118,14 +129,40 @@ export class PlaneApi {
     };
   }
 
-  async postComment(workItemId: string, html: string): Promise<void> {
-    await this.client.workItems.comments.create(
+  async postComment(workItemId: string, html: string): Promise<PlaneComment> {
+    const created = await this.client.workItems.comments.create(
       this.workspaceSlug,
       this.projectId,
       workItemId,
       { comment_html: html },
     );
-    this.logger.debug({ workItemId }, "posted plane comment");
+    this.logger.debug({ workItemId, commentId: created.id }, "posted plane comment");
+    return toPlaneComment(created);
+  }
+
+  /**
+   * List every comment on a work item, paginated. Comments are returned in
+   * Plane's natural order; callers that want chronological should sort by
+   * `createdAt`.
+   */
+  async listComments(workItemId: string): Promise<PlaneComment[]> {
+    const comments: PlaneComment[] = [];
+    const limit = 100;
+    let offset = 0;
+    while (true) {
+      const page = await this.client.workItems.comments.list(
+        this.workspaceSlug,
+        this.projectId,
+        workItemId,
+        { limit, offset },
+      );
+      for (const raw of page.results) {
+        comments.push(toPlaneComment(raw));
+      }
+      if (!page.next_page_results || page.results.length < limit) break;
+      offset += limit;
+    }
+    return comments;
   }
 
   async updateDescriptionHtml(
@@ -184,6 +221,25 @@ function stripHtmlToText(html: string): string {
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .join("\n");
+}
+
+function toPlaneComment(raw: {
+  id: string;
+  created_at?: string;
+  comment_stripped?: string;
+  comment_html?: string;
+  actor?: string;
+}): PlaneComment {
+  const html = raw.comment_html ?? "";
+  const strippedRaw = raw.comment_stripped ?? "";
+  const text = strippedRaw.trim().length > 0 ? strippedRaw : stripHtmlToText(html);
+  return {
+    id: raw.id,
+    createdAt: toDate(raw.created_at),
+    text,
+    html,
+    actor: raw.actor ?? null,
+  };
 }
 
 function toPlaneIssue(item: WorkItemBase): PlaneIssue {

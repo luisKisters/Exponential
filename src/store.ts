@@ -42,6 +42,12 @@ export interface IssueRow {
   head_sha: string | null;
   loops: number;
   preview_url: string | null;
+  /** ISO timestamp of the most recent Plane comment we've already accounted for (ours or theirs). */
+  last_seen_comment_at: string | null;
+  /** Reviewer feedback text waiting to be folded into the next planning loop. */
+  pending_feedback: string | null;
+  /** How many times we've retried a failed Vercel preview deploy for this issue. */
+  preview_retry_count: number;
 }
 
 export interface PickupInsert {
@@ -106,6 +112,11 @@ export class Store {
       "head_sha TEXT",
       "loops INTEGER NOT NULL DEFAULT 0",
       "preview_url TEXT",
+      // Phase 4.5 — comment-driven revise loop bookkeeping.
+      "last_seen_comment_at TEXT",
+      "pending_feedback TEXT",
+      // Phase 5 (slice 5a) — Vercel preview retriable resource.
+      "preview_retry_count INTEGER NOT NULL DEFAULT 0",
     ];
     for (const col of extraColumns) {
       try {
@@ -185,12 +196,16 @@ export class Store {
                priority = ?,
                picked_up_at = ?,
                updated_at = ?,
-               attempts = attempts + 1
+               attempts = attempts + 1,
+               last_seen_comment_at = ?,
+               pending_feedback = NULL,
+               preview_retry_count = 0
          WHERE plane_work_item_id = ?`,
       );
       update.run(
         input.name,
         input.priority,
+        now,
         now,
         now,
         input.workItemId,
@@ -199,8 +214,9 @@ export class Store {
       const insert = this.db.prepare(
         `INSERT INTO issues (
             plane_work_item_id, workspace_slug, project_id, sequence_id,
-            name, priority, status, picked_up_at, updated_at, attempts
-         ) VALUES (?, ?, ?, ?, ?, ?, 'picked_up', ?, ?, 1)`,
+            name, priority, status, picked_up_at, updated_at, attempts,
+            last_seen_comment_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 'picked_up', ?, ?, 1, ?)`,
       );
       insert.run(
         input.workItemId,
@@ -209,6 +225,7 @@ export class Store {
         input.sequenceId,
         input.name,
         input.priority,
+        now,
         now,
         now,
       );
@@ -379,6 +396,117 @@ export class Store {
        WHERE plane_work_item_id = ?`,
     );
     stmt.run(error, now, workItemId);
+  }
+
+  /**
+   * Advance the high-watermark so future comment polls ignore everything up to
+   * and including `createdAt`. Used both when we post our own comment (skip
+   * processing it as feedback) and when we consume a reviewer comment.
+   */
+  advanceCommentWatermark(workItemId: string, createdAt: Date): void {
+    const iso = createdAt.toISOString();
+    const stmt = this.db.prepare(
+      `UPDATE issues
+         SET last_seen_comment_at = CASE
+              WHEN last_seen_comment_at IS NULL OR last_seen_comment_at < ? THEN ?
+              ELSE last_seen_comment_at
+            END
+       WHERE plane_work_item_id = ?`,
+    );
+    stmt.run(iso, iso, workItemId);
+  }
+
+  getLastSeenCommentAt(workItemId: string): string | null {
+    const row = this.db.prepare(
+      `SELECT last_seen_comment_at FROM issues WHERE plane_work_item_id = ?`,
+    ).get(workItemId) as { last_seen_comment_at: string | null } | undefined;
+    return row?.last_seen_comment_at ?? null;
+  }
+
+  /**
+   * Add reviewer feedback to the pending pile. Accumulates if multiple comments
+   * come in before the next planning loop has a chance to drain them.
+   */
+  appendPendingFeedback(workItemId: string, text: string): void {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return;
+    const existing = this.db.prepare(
+      `SELECT pending_feedback FROM issues WHERE plane_work_item_id = ?`,
+    ).get(workItemId) as { pending_feedback: string | null } | undefined;
+    const next = existing?.pending_feedback
+      ? `${existing.pending_feedback}\n\n${trimmed}`
+      : trimmed;
+    this.db.prepare(
+      `UPDATE issues SET pending_feedback = ?, updated_at = ? WHERE plane_work_item_id = ?`,
+    ).run(next, new Date().toISOString(), workItemId);
+  }
+
+  /** Read-and-clear the pending feedback in one transaction. */
+  takePendingFeedback(workItemId: string): string | null {
+    const tx = this.db.transaction((id: string): string | null => {
+      const row = this.db.prepare(
+        `SELECT pending_feedback FROM issues WHERE plane_work_item_id = ?`,
+      ).get(id) as { pending_feedback: string | null } | undefined;
+      const value = row?.pending_feedback ?? null;
+      if (value !== null) {
+        this.db.prepare(
+          `UPDATE issues SET pending_feedback = NULL, updated_at = ? WHERE plane_work_item_id = ?`,
+        ).run(new Date().toISOString(), id);
+      }
+      return value;
+    });
+    return tx(workItemId);
+  }
+
+  /**
+   * Issues we still "own" for the purposes of comment polling. Anything that
+   * has reached `done` is out — but `human_review` and `failed` stay in scope
+   * so the reviewer can revise post-pipeline.
+   */
+  listFeedbackTargets(): IssueRow[] {
+    return this.db.prepare(
+      `SELECT * FROM issues WHERE status NOT IN ('done') ORDER BY updated_at DESC`,
+    ).all() as IssueRow[];
+  }
+
+  /**
+   * After a successful Vercel preview retry exhaustion, the orchestrator wants
+   * to know "have we tried N times yet". `incrementPreviewRetry` returns the
+   * new count.
+   */
+  incrementPreviewRetry(workItemId: string): number {
+    const tx = this.db.transaction((id: string): number => {
+      this.db.prepare(
+        `UPDATE issues SET preview_retry_count = preview_retry_count + 1, updated_at = ? WHERE plane_work_item_id = ?`,
+      ).run(new Date().toISOString(), id);
+      const row = this.db.prepare(
+        `SELECT preview_retry_count FROM issues WHERE plane_work_item_id = ?`,
+      ).get(id) as { preview_retry_count: number } | undefined;
+      return row?.preview_retry_count ?? 0;
+    });
+    return tx(workItemId);
+  }
+
+  resetPreviewRetry(workItemId: string): void {
+    this.db.prepare(
+      `UPDATE issues SET preview_retry_count = 0, updated_at = ? WHERE plane_work_item_id = ?`,
+    ).run(new Date().toISOString(), workItemId);
+  }
+
+  /**
+   * Reset a tracked issue (in any status) back to `picked_up` so the pipeline
+   * re-enters from the plan stage. Used by the feedback loop when a reviewer
+   * comments on a human_review/failed issue.
+   */
+  reopenForFeedback(workItemId: string): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `UPDATE issues
+         SET status = 'picked_up',
+             last_error = NULL,
+             updated_at = ?
+       WHERE plane_work_item_id = ?`,
+    ).run(now, workItemId);
   }
 
   close(): void {

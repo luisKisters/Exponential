@@ -23,6 +23,8 @@ export interface BuildInput {
   branch: string;
   worktreePath: string;
   planRelPath: string;
+  /** Optional abort signal for reviewer-feedback interruption. */
+  signal?: AbortSignal;
 }
 
 export interface BuildResult {
@@ -35,6 +37,8 @@ export interface BuildResult {
   phases: PhaseOutcome[];
   /** AC ticking result against the Plane description. */
   tickResult: TickResult | null;
+  /** True if the build was interrupted by reviewer feedback. */
+  aborted: boolean;
 }
 
 export interface PhaseOutcome {
@@ -76,7 +80,7 @@ export class Builder {
   }
 
   async build(input: BuildInput): Promise<BuildResult> {
-    const { issue, branch, worktreePath, planRelPath } = input;
+    const { issue, branch, worktreePath, planRelPath, signal } = input;
     const shortId = `PLANE-${issue.sequenceId}`;
 
     this.store.markBuilding(issue.id);
@@ -174,6 +178,7 @@ export class Builder {
           timeoutMs: this.config.claude.timeoutMs,
           binary: this.config.claude.binary,
           extraArgs: this.config.claude.extraArgs,
+          signal,
         });
 
         this.store.recordEvent(issue.id, "build_attempt_finished", {
@@ -182,7 +187,12 @@ export class Builder {
           signal: lastResult.signal,
           doneFlagSeen: lastResult.doneFlagSeen,
           timedOut: lastResult.timedOut,
+          aborted: lastResult.aborted,
         });
+
+        // Reviewer interrupted us — stop the retry loop immediately so the
+        // orchestrator can re-plan with the feedback included.
+        if (lastResult.aborted) break;
 
         const flagContent = await safeRead(doneFlagAbs);
         const verdict = (flagContent ?? "").trim().split(/\s+/)[0] ?? "";
@@ -216,6 +226,25 @@ export class Builder {
           this.logger.warn({ err }, "failed to stop dev server cleanly");
         }
       }
+    }
+
+    const aborted = lastResult?.aborted === true;
+    if (aborted) {
+      // Don't post a build comment, don't push, don't mark build failed.
+      // The orchestrator will re-plan with reviewer feedback included.
+      this.store.recordEvent(issue.id, "build_aborted_for_feedback", {
+        attempts: attempt,
+      });
+      // Clean up the done.flag if it was left around (mid-write).
+      if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
+      return {
+        ok: false,
+        attempts: attempt,
+        headSha: null,
+        phases: [],
+        tickResult: null,
+        aborted: true,
+      };
     }
 
     const finalProgress = (await safeRead(progressAbs)) ?? "";
@@ -271,7 +300,7 @@ export class Builder {
 
     // Final Plane comment.
     try {
-      await this.plane.postComment(
+      const buildComment = await this.plane.postComment(
         issue.id,
         buildResultCommentHtml({
           ok,
@@ -282,6 +311,7 @@ export class Builder {
           tickResult,
         }),
       );
+      this.store.advanceCommentWatermark(issue.id, buildComment.createdAt);
     } catch (err) {
       this.logger.error(
         { err, workItemId: issue.id },
@@ -316,6 +346,7 @@ export class Builder {
       headSha: pushedSha,
       phases,
       tickResult,
+      aborted: false,
     };
   }
 
