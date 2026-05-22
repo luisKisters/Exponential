@@ -262,6 +262,41 @@ Wire the E2E agent and connect the full pipeline with failure loops.
 
 ---
 
+### Phase 4.5: Comment-driven revise loop
+
+Phase 4 closes the loop with E2E, but the reviewer (me) is still the last hop and has no way to *steer* the agent without hand-editing files. Add a feedback channel: I drop a comment on the Plane issue, the orchestrator notices, interrupts whatever Claude session is running, and re-enters the pipeline with the comment folded into `priorFailures`.
+
+The same channel works in two situations:
+
+1. **Mid-flight steering.** I see the agent going the wrong way while it is still in `planning` / `building` / `e2e_testing`. I comment, the active Claude session is killed cleanly, and the orchestrator restarts the planning stage with my note attached.
+2. **Post-pipeline revise.** The pipeline already landed in `Human Review` (or `Failed`) and I want a change. I comment on the issue; the orchestrator re-opens the SQLite row, resets it to pre-planning, and runs the full plan→build→e2e loop again with my note attached.
+
+**What to build:**
+
+- **Comment polling.** Every poll cycle, list comments for every SQLite-tracked issue that is *not* terminal-Done (so: non-terminal pipeline states **and** `human_review` / `failed`). Filter to comments newer than `last_seen_comment_at` and not authored by the bot. The bot's own comments are tracked client-side: every `postComment` updates `last_seen_comment_at` to the just-created comment's `created_at`, so we never react to ourselves.
+- **SQLite bookkeeping.**
+  - `last_seen_comment_at TEXT` — high watermark, advanced by every bot post and by every consumed feedback comment.
+  - `pending_feedback TEXT` — accumulator of unconsumed reviewer notes. Drained when the next planning loop starts.
+- **Interrupt mechanism.** `ClaudeSession.abort()` triggers the same `/exit` → `SIGTERM` → `SIGKILL` shutdown sequence already used at end-of-session, and the run() promise resolves with a new `aborted: true` flag. The orchestrator wires the active session into a per-issue handle so the watcher can find it.
+- **Re-entry.** When `pending_feedback` is set on a tracked issue:
+  - If the issue is in a non-terminal pipeline state: the watcher aborts the current session. The pipeline catches the abort, reads `pending_feedback`, clears it, and re-enters the `plan` stage with the feedback prepended to `priorFailures`. Loop counter does **not** advance (it isn't an E2E failure — it's a steering correction).
+  - If the issue is in `human_review` or `failed`: the watcher resets the row to `picked_up` (preserving branch/worktree/plan_path), clears `pending_feedback` into a `revisionFeedback` field on the next planner invocation, and the orchestrator picks the issue back up from `plan` stage on the next cycle. The Plane state is **not** auto-moved back to "In Progress" — the row's SQLite status drives the pipeline; the human can update Plane state independently.
+- **Bot-author detection.** Comments authored by the API key user (us) are filtered out by `last_seen_comment_at` advancement (we always update the watermark right after a successful post). As a belt-and-braces fallback, the orchestrator records every comment id it has posted (in-memory + SQLite events) and the comment listing filters those out too.
+- **Prompt extension.** The planning prompt grows a small "Reviewer feedback (from Plane comments since last loop)" block, populated only when feedback is present. The building / E2E prompts already carry priorFailures and need no shape change.
+
+**Acceptance test:**
+
+- Take an issue all the way to `Human Review`. Post a comment like "the button should be teal, not blue". Within `POLL_INTERVAL_MS` the orchestrator transitions the SQLite row back to a working state, the planner runs again with the comment visible in its prompt, and a fresh build+e2e cycle lands a new preview.
+- While an issue is mid-build, post "no, refactor the whole thing into a hook instead". The current building session is killed, the next planning session sees the comment, and the resulting plan reflects the new direction (verify by reading `plan.md` diff).
+- Post-revise comments are visible in SQLite events (`feedback_detected`, `session_aborted_for_feedback`, `feedback_consumed`).
+- Bot comments never trigger another loop on themselves (`last_seen_comment_at` advances after every `postComment`).
+
+**Not terminal-testable:**
+
+- **Whether the reviewer's free-text feedback actually nudged the agent toward the desired outcome.** Same plan-quality gap as Phase 2 — the orchestrator can show the comment was ingested, but only a human reading the revised plan can confirm "yes, that's what I meant".
+
+---
+
 ### Phase 5: Operational hardening
 
 Round out the pipeline so infra hiccups don't masquerade as code failures, condense the per-issue memory into one file, and switch Vercel handling from "poll GitHub statuses" to "drive Vercel CLI directly" — the latter unblocks env-var injection (e.g. `CONVEX_DEPLOY_KEY` on preview) and gives us real build logs to feed back into the retry context.
@@ -296,6 +331,13 @@ This phase exists because Phase 4's first end-to-end run surfaced three real pro
 - Fix the env var, run a fresh issue, confirm the orchestrator now talks to Vercel CLI instead of polling `gh api`.
 - Confirm `memory.md` is the only narrative file on the branch — no `progress.md`, no `failures.md`.
 - Confirm this phase's commits appear in `origin/main` as separate `feat(phase-5): …` commits, not one mega-commit.
+
+**Shipped in slice 5a (Vercel retriable resource — this commit):**
+
+- `preview_retry_count` column + `MAX_PREVIEW_RETRIES` cap (default 3).
+- On Vercel preview failure (`state !== "success"` or no URL): increment counter, post a "preview build failed (attempt N/MAX), retrying" comment, leave SQLite status at `built`, return without finishing the pipeline. The next poll cycle's restart-recovery path re-enters at the preview-wait/e2e stage.
+- On cap exhausted: transition to Failed with `last_error = "vercel preview failed N time(s)"`.
+- The Vercel-CLI switch, `memory.md` consolidation, and per-phase-commit workflow are still deferred — captured as slices 5b/5c/5d for later turns.
 
 ---
 
@@ -423,6 +465,13 @@ Verdict (pass/fail), retry-loop transitions, terminal-state writes (`Human Revie
 **Not terminal-testable:**
 - **Visual rendering of the Vercel preview.** `curl` can fetch the HTML and confirm a 200, but cannot confirm "the tooltip actually shows up" or "the layout isn't broken" — that's what the E2E agent does inside its own browser tool, and that browser instance is not surfaced back to us. A human or screen-recording would be needed to fully replay it.
 - **Whether the E2E agent's verdict matches the user's intent**, beyond the structured acceptance checks. Same review gap as plan quality.
+
+### Phase 4.5 — Comment-driven revise loop
+
+Comment-listing API output, `last_seen_comment_at` advancement after every bot post, SQLite events for `feedback_detected` / `session_aborted_for_feedback` / `feedback_consumed`, and the resulting per-loop `priorFailures` block visible in agent prompts — all in SQLite + Plane + log lines.
+
+**Not terminal-testable:**
+- **Whether the agent actually followed the feedback.** The orchestrator can prove "your comment text was placed in the next planning prompt"; whether the revised plan reflects what you meant requires reading `plan.md` diffs.
 
 ### Phase 5 — Operational hardening
 
