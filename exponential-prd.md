@@ -208,6 +208,14 @@ Wire the building agent into the orchestrator.
 - Retry logic: if Claude Code exits with failures noted in per-issue memory, re-invoke up to 3 times with the failure context included in the prompt
 - On success: ensure all changes committed and pushed, write summary to `.agent/issues/PLANE-{id}/summary.md`, post Plane comment
 - On failure after 3 retries: write failure details, signal to orchestrator
+- **Plane description sync:** before the first phase starts, write the plan into the issue **description** (not a comment) so a reviewer can see the plan at the top of the issue without scrolling through comments. To avoid stomping on the human's original ask, the orchestrator owns a fenced block delimited by sentinel HTML comments and only ever rewrites what's inside it:
+  ```html
+  <!-- exponential:plan v1 start -->
+  …current plan markdown rendered as HTML…
+  <!-- exponential:plan v1 end -->
+  ```
+  If the sentinels don't exist yet, append them to the end of the description. The human-authored text outside the fence is never touched.
+- **Acceptance-criteria check-off:** as each phase of the plan finishes building (typecheck + build + browser-check all green), the orchestrator parses the `## Acceptance Criteria` section of the issue description, identifies which AC bullets the just-finished phase satisfies, and toggles `- [ ]` → `- [x]` for those bullets. Mapping is driven by an explicit `Satisfies AC: …` line that each phase in `plan.md` is expected to carry — this means the planning-prompt template (currently in `src/prompts/planning.ts`) needs a small extension as part of Phase 3 work to instruct the agent to emit that line. Phase 2's already-shipped behaviour is otherwise unchanged. If a phase's `Satisfies AC:` references a bullet that doesn't textually exist in the description, log a warning and skip silently — don't fail the build over a stale mapping.
 
 **Acceptance test:**
 - Given an issue with a completed plan (from Phase 2), trigger the building agent
@@ -218,6 +226,8 @@ Wire the building agent into the orchestrator.
 - Branch is pushed to GitHub
 - Vercel preview deployment starts (visible in GitHub commit statuses)
 - Plane comment shows what was built
+- **Plane description now contains the plan inside the `<!-- exponential:plan … -->` fence, and the human's original ask above the fence is unchanged byte-for-byte.**
+- **At least one acceptance-criteria checkbox is now `- [x]` (assuming the issue had ACs and the plan mapped to them).**
 - Worktree and dev server cleaned up
 
 ---
@@ -236,6 +246,7 @@ Wire the E2E agent and connect the full pipeline with failure loops.
 - Terminal states:
   - Success: move Plane issue to "Human Review", post summary comment
   - Failure after 3 loops: move to "Failed", post comment with failure history
+- **Plane description re-sync on retry:** every time the planning agent revises the plan (a retry triggered by E2E failure), the orchestrator rewrites the same fenced block introduced in Phase 3 with the new plan. Acceptance-criteria checkboxes already ticked stay ticked (we never un-check), since "this AC was demonstrably satisfied at some point" is still useful signal even if the plan rolled.
 - Cleanup: remove worktrees, kill any lingering dev servers, clean `/workspaces/PLANE-{id}/`
 
 **Acceptance test:**
@@ -251,7 +262,100 @@ Wire the E2E agent and connect the full pipeline with failure loops.
 
 ---
 
-### Phase 5: Deployment
+### Phase 5: Operational hardening
+
+Round out the pipeline so infra hiccups don't masquerade as code failures, condense the per-issue memory into one file, and switch Vercel handling from "poll GitHub statuses" to "drive Vercel CLI directly" — the latter unblocks env-var injection (e.g. `CONVEX_DEPLOY_KEY` on preview) and gives us real build logs to feed back into the retry context.
+
+This phase exists because Phase 4's first end-to-end run surfaced three real problems that would silently waste tokens or block forever in production:
+
+1. The Plane API ignores the `state` query param and returns *all* issues — without a client-side filter, Backlog and Todo issues get treated as candidates.
+2. The Plane API leaves `description_stripped` empty for issues created/updated via REST — the planning agent saw no description and wrote `Satisfies AC: none` for every phase. Already patched in code with an HTML-stripping fallback; the PRD-level lesson is that "the bot only sees what Plane bothers to give it" needs explicit instrumentation.
+3. Vercel build failures (e.g. missing `CONVEX_DEPLOY_KEY` on preview env) currently terminal-fail the issue. Infra problems shouldn't burn a retry loop — the build code is fine, only the deploy keys are wrong.
+
+**What to build:**
+- **Vercel as a retriable resource, not a terminal one.** When a Vercel deployment fails for the head sha, the orchestrator does not move Plane to "Failed". Instead:
+  - SQLite gains a `preview_retry_count` column (default 0).
+  - On Vercel failure, increment the counter, post a "preview build failed (attempt N/MAX), retrying" Plane comment, leave the issue in `built` SQLite status, and re-enter the preview-wait stage on the next orchestrator cycle.
+  - Hard cap: `MAX_PREVIEW_RETRIES` (default **3**, mirrors `MAX_PIPELINE_LOOPS`). Only after exhausting the cap do we transition to Failed with a clear `last_error="vercel preview failed N times, see logs"`.
+  - Each failed Vercel attempt's build log is captured (see next item) and stitched into the planner's `priorFailures` block on the *next* pipeline loop — sometimes a "Vercel build failed" is really "code broke a thing only Next/Convex catches at build time" and the planner can use that.
+- **Use the Vercel CLI for deploys + log retrieval.** Today the orchestrator pushes a branch and waits for GitHub-triggered Vercel auto-deploys. Switch to running `npx vercel deploy --token $VERCEL_TOKEN --target preview --yes` (or `vercel build && vercel deploy --prebuilt`) from the worktree:
+  - Lets the orchestrator pass `--build-env CONVEX_DEPLOY_KEY=$KEY` directly, bypassing per-environment Vercel UI config.
+  - Returns the preview URL synchronously, with no need to poll GitHub deployment statuses.
+  - On failure, run `npx vercel inspect --logs <url>` and write the build log to `memory.md` so the next planning loop sees *why* it failed, not just *that* it failed.
+  - GitHub-triggered auto-deploys can still run in parallel (they'll be redundant, just noise). Optionally configure summario's `vercel.json` `ignoreCommand` to skip auto-deploys on `agent/*` branches once orchestrator-driven deploys are reliable.
+- **Per-issue memory consolidation: `memory.md`.** Today each issue has `progress.md`, `failures.md`, and `summary.md` — overlapping and confusing. Collapse to:
+  - `plan.md` — planning agent output (unchanged).
+  - `memory.md` — append-only narrative log across all sessions for this issue. One section per session (planning, each phase build, review pass, e2e loop) with status / notes / link-outs. Replaces both `progress.md` and `failures.md`.
+  - `summary.md` — final human-facing reviewer notes at the end of a successful run (unchanged).
+  - `done.flag` / verdict files — unchanged transient signals.
+- **Exponential-repo self-commit workflow.** From this phase forward, each Phase 5/6/7 worth of work in *this* repo (the orchestrator codebase, not summario) ships as its own `feat(phase-N): …` commit pushed to `origin/main`, so the repo's history shows progress phase-by-phase instead of one-shot dumps at the end of a session.
+
+**Acceptance test:**
+- Trigger a build whose Vercel deploy is *guaranteed* to fail (e.g. point `CONVEX_DEPLOY_KEY` at an invalid value via `BUILDER_EXTRA_ENV`).
+- Observe: the orchestrator retries 3× with the Vercel build log captured to `memory.md` each time, posts a comment per retry, and only on the third failure transitions Plane to Failed with `last_error` mentioning "vercel preview failed 3 times".
+- Fix the env var, run a fresh issue, confirm the orchestrator now talks to Vercel CLI instead of polling `gh api`.
+- Confirm `memory.md` is the only narrative file on the branch — no `progress.md`, no `failures.md`.
+- Confirm this phase's commits appear in `origin/main` as separate `feat(phase-5): …` commits, not one mega-commit.
+
+---
+
+### Phase 6: Multi-session builder
+
+Today one Claude session implements every phase of `plan.md` — long, expensive, and the context drifts the further you go. Switch to one fresh Claude session per plan phase, sharing state through `memory.md`.
+
+**Why:**
+- **Cheaper.** Per-session context starts fresh at the plan + memory, not at the entire transcript of previous phase work. On a 4-phase plan, this is roughly a 2-4× input-token reduction.
+- **Sharper.** Each session has only the context it actually needs to implement *this phase*, not the agent's reasoning trail from earlier phases. Less context-clouding, fewer "the agent forgot the original constraint" failures.
+- **Bounded.** Per-session timeouts (`PHASE_TIMEOUT_MS`, default 15 min) replace the current 30-min cap on the whole build run.
+
+**What to build:**
+- The Builder no longer spawns one Claude with the full plan. Instead it loops over `plan.md` phases and, for each:
+  1. Build a per-phase prompt that contains: the full plan (for context), `memory.md` so far (what previous sessions did), and an explicit "implement Phase N and only Phase N" instruction.
+  2. Spawn Claude in the worktree, wait for that phase's `done.flag`.
+  3. Append the agent's outcome section to `memory.md` (status, attempts, satisfied AC, notes).
+  4. Run `pnpm build` + commit the phase's changes from the orchestrator side (rather than trusting the agent to commit), so per-phase commits are uniform.
+  5. If phase failed: append failure notes to `memory.md`, optionally retry the same phase in a fresh session (up to `PHASE_MAX_ATTEMPTS`, default 2), then either skip remaining phases or terminate the loop.
+- The orchestrator-level pipeline loop (plan → build → review → e2e) is unchanged; only the build *stage* internals are rewritten.
+- Each per-phase session is told: "Do not run dev server, do not push, do not call Plane — the orchestrator handles all of that. You implement, you run `pnpm build`, you write to `memory.md`, you exit."
+
+**Acceptance test:**
+- Pick up a 3-phase issue. Verify the orchestrator spawns exactly 3 Claude sessions (one per phase), each visible as separate `claude_session_started` / `claude_session_finished` event pairs in SQLite.
+- `memory.md` on the branch has 3 phase-build sections, each authored by a distinct session, with prior sections visible to each later session at start time.
+- Total Claude wall-clock time for the build stage is ≤ today's single-session time (best-case much less; worst-case equal if phases happen to need everything).
+- A deliberately-failing Phase 2 surfaces as: Phase 1 session completes + commits + writes memory, Phase 2 session fails after retries + writes memory, Phase 3 session is *not* started (build stage terminates).
+
+---
+
+### Phase 7: Review pass
+
+Insert a code-review hop between Build and E2E so we catch correctness/maintainability bugs the human reviewer would otherwise have to find. Output is a structured findings file; a *separate* fresh Claude session addresses the findings before E2E runs.
+
+**Why this is its own session, not the builder's:**
+- The builder's context is biased toward "I just wrote this" — it's bad at finding its own mistakes.
+- A fresh reviewer session, with no implementation context, reads the diff cold and judges it against the plan and the original issue.
+- The fixup session is *also* fresh — it reads only the review findings + the diff, with no attachment to the original implementation decisions.
+
+**What to build:**
+- After the Builder finishes successfully, the orchestrator spawns a **Review session**:
+  - Prompt: "You are reviewing the diff at `agent/PLANE-{seq}-…` against `plan.md` and the original Plane issue. Use the `/review` skill / equivalent code-review checklist. Surface concrete bugs, regressions, type holes, and out-of-scope changes. Skip nits."
+  - Output: `review.md` with a structured list of findings (severity, file:line, description, suggested fix).
+  - On verdict `review-clean` (no actionable findings), skip the fixup session entirely and go straight to E2E.
+- If `review.md` has findings, spawn a **Fixup session** in the same worktree:
+  - Prompt: "Read `review.md`. Address each finding (or explicitly note why it isn't actionable). Run `pnpm build`. Append outcome to `memory.md`. Commit. Exit."
+  - The fixup session has no other context from the build run.
+- After fixup, the orchestrator re-runs the review session *once*. If still not clean, log the remaining findings and proceed to E2E anyway — the human reviewer will see them in `review.md` on the branch. (We don't want to block forever on subjective review feedback.)
+- Pipeline order: plan → multi-session build (Phase 6) → review → fixup-if-needed → review-recheck → e2e → terminal state.
+
+**Acceptance test:**
+- Run a build that has an obvious code-smell (e.g. duplicated logic, unused import, swallowed error). Confirm:
+  - Review session produces `review.md` with at least one finding.
+  - Fixup session lands a new commit addressing the finding.
+  - Review-recheck either says `review-clean` or surfaces *different* remaining findings (not the same ones — the fixup actually did something).
+- Run a build with no real issues. Confirm `review.md` says `review-clean` and the pipeline goes straight to E2E.
+
+---
+
+### Phase 8: Deployment
 
 Deploy the orchestrator to the server via Coolify.
 
@@ -320,7 +424,28 @@ Verdict (pass/fail), retry-loop transitions, terminal-state writes (`Human Revie
 - **Visual rendering of the Vercel preview.** `curl` can fetch the HTML and confirm a 200, but cannot confirm "the tooltip actually shows up" or "the layout isn't broken" — that's what the E2E agent does inside its own browser tool, and that browser instance is not surfaced back to us. A human or screen-recording would be needed to fully replay it.
 - **Whether the E2E agent's verdict matches the user's intent**, beyond the structured acceptance checks. Same review gap as plan quality.
 
-### Phase 5 — Deployment
+### Phase 5 — Operational hardening
+
+Vercel-retry transitions, `MAX_PREVIEW_RETRIES` cap, `memory.md` presence/absence, `vercel inspect --logs` output captured into `memory.md`, and the per-phase commit history of the *exponential* repo — all in SQLite + filesystem + `git log`.
+
+**Not terminal-testable:**
+- **Whether the captured Vercel build log is *useful* to the next planning loop.** The orchestrator can stitch it into `priorFailures`, but whether the planner actually understands "next/font fails because Convex schema diverged" requires looking at the revised plan. Same plan-quality gap as Phase 2.
+
+### Phase 6 — Multi-session builder
+
+Per-session `claude_session_started`/`claude_session_finished` event counts in SQLite, `memory.md` section authorship, per-phase commit timestamps, total wall-clock vs single-session baseline — all terminal.
+
+**Not terminal-testable:**
+- **Whether fresh sessions actually produce better-quality work** (the whole point of the split). Token cost is measurable from logs; quality requires reading the resulting diffs.
+
+### Phase 7 — Review pass
+
+Presence of `review.md` on the branch, fixup-session commit appearing between review and re-review, structured findings count per loop — all terminal.
+
+**Not terminal-testable:**
+- **Whether the reviewer's findings are correct.** A code-review agent can hallucinate problems; only a human reading the diff + `review.md` knows whether the findings are real.
+
+### Phase 8 — Deployment
 
 `docker ps`, `docker stats`, `docker inspect`, `gh api` for branch protection, Coolify's own HTTP API — all terminal.
 
