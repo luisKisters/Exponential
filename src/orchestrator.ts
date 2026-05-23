@@ -13,7 +13,12 @@ import {
   type PlanResult,
 } from "./planner.js";
 import type { IssueRow, Store } from "./store.js";
-import { deriveGhRepo, waitForPreview } from "./vercel.js";
+import {
+  deriveGhRepo,
+  fetchBuildLogs,
+  waitForPreview,
+  type PreviewResult,
+} from "./vercel.js";
 
 type StageOutcome<T> =
   | { ok: true; aborted: false; result: T }
@@ -538,45 +543,29 @@ export class Orchestrator {
           return;
         }
 
-        const previewUrl = await this.waitForPreviewSafely(issue, sha);
-        if (!previewUrl) {
-          // Phase 5 (slice 5a): vercel preview is treated as a retriable
-          // resource. Each failure increments preview_retry_count, posts a
-          // comment, and we let the pipeline retry the e2e stage. Only after
-          // exhausting MAX_PREVIEW_RETRIES do we transition to Failed.
-          const retried = this.store.incrementPreviewRetry(issue.id);
-          this.store.recordEvent(issue.id, "preview_retry", {
-            attempt: retried,
-            cap: this.config.vercel.maxPreviewRetries,
-            sha,
-          });
-          if (retried >= this.config.vercel.maxPreviewRetries) {
-            await this.finishPipeline(issue, "failed", {
-              reason: `vercel preview failed ${retried} time(s)`,
-              previewUrl: null,
-              planResult,
-              loop,
-            });
-            return;
-          }
-          try {
-            const c = await this.plane.postComment(
-              issue.id,
-              `<p><strong>Vercel preview build failed</strong> (attempt ${retried}/${this.config.vercel.maxPreviewRetries}). Retrying.</p>`,
-            );
-            this.store.advanceCommentWatermark(issue.id, c.createdAt);
-          } catch {
-            // best-effort
-          }
-          // Brief pause so we don't hammer the GitHub API and so Vercel has a
-          // chance to (re)spin a new build.
-          await new Promise((r) => setTimeout(r, this.config.vercel.retryPauseMs));
-          // Stay on `e2e` stage; loop body will re-enter waitForPreviewSafely.
+        const previewOutcome = await this.waitForOrFixupPreview(
+          issue,
+          planResult,
+          sha,
+          loop,
+        );
+        if (previewOutcome.aborted) {
+          stage = "plan";
           continue;
         }
+        if (!previewOutcome.ok) {
+          await this.finishPipeline(issue, "failed", {
+            reason: previewOutcome.reason ?? "vercel preview never became available",
+            previewUrl: previewOutcome.previewUrl,
+            planResult,
+            loop,
+          });
+          return;
+        }
+        const previewUrl = previewOutcome.previewUrl;
 
-        // Got a working preview — reset the retry counter for next time.
-        this.store.resetPreviewRetry(issue.id);
+        // Got a working preview — reset the fixup counter for next time.
+        this.store.resetPreviewFixupAttempts(issue.id);
 
         const out = await this.runE2e(issue, planResult, previewUrl, loop, priorFailures);
         if (out.aborted) {
@@ -778,7 +767,7 @@ export class Orchestrator {
   private async waitForPreviewSafely(
     issue: PlaneIssue,
     sha: string,
-  ): Promise<string | null> {
+  ): Promise<PreviewResult | null> {
     if (!this.ghRepo) {
       this.logger.error(
         { workItemId: issue.id },
@@ -800,24 +789,141 @@ export class Orchestrator {
         deploymentId: result.deploymentId,
         timedOut: result.timedOut,
       });
-      if (result.state !== "success") {
-        this.logger.warn(
-          { sha, state: result.state, url: result.url },
-          "vercel preview did not succeed; skipping e2e",
-        );
-        return null;
-      }
-      if (!result.url) {
-        this.logger.warn({ sha }, "vercel preview marked success but no url returned");
-        return null;
-      }
-      return result.url;
+      return result;
     } catch (err) {
       this.logger.error({ err, sha }, "preview wait threw");
       this.store.recordEvent(issue.id, "preview_wait_failed", {
         error: err instanceof Error ? err.message : String(err),
       });
       return null;
+    }
+  }
+
+  /**
+   * Phase 5 slice 5a-v2: wait for a Vercel preview to succeed, OR spawn a
+   * sequence of Claude fixup sessions that diagnose the build failure from
+   * the captured log and try to fix the code. Each fixup ends with a new
+   * commit + push, which triggers a fresh Vercel deploy on a new SHA. Caps
+   * at `MAX_PREVIEW_FIXUP_ATTEMPTS`.
+   */
+  private async waitForOrFixupPreview(
+    issue: PlaneIssue,
+    planResult: PlanResult,
+    initialSha: string,
+    loop: number,
+  ): Promise<
+    | { ok: true; aborted: false; previewUrl: string }
+    | { ok: false; aborted: true; previewUrl: null }
+    | { ok: false; aborted: false; previewUrl: string | null; reason: string }
+  > {
+    let sha = initialSha;
+    let priorFailures = "";
+
+    while (true) {
+      const result = await this.waitForPreviewSafely(issue, sha);
+      if (result && result.state === "success" && result.url) {
+        return { ok: true, aborted: false, previewUrl: result.url };
+      }
+
+      const previewUrl = result?.url ?? null;
+      const failureState = result?.state ?? "unreachable";
+      const attempt = this.store.incrementPreviewFixupAttempt(issue.id);
+      const cap = this.config.vercel.maxPreviewFixupAttempts;
+
+      this.store.recordEvent(issue.id, "preview_fixup_planned", {
+        attempt,
+        cap,
+        sha,
+        state: failureState,
+        previewUrl,
+      });
+
+      if (attempt > cap) {
+        return {
+          ok: false,
+          aborted: false,
+          previewUrl,
+          reason: `vercel preview failed after ${cap} fixup attempt(s)`,
+        };
+      }
+
+      if (!previewUrl) {
+        // Without a deployment URL we can't fetch logs, so we can't ask an
+        // agent to fix anything productive. Surface as terminal.
+        return {
+          ok: false,
+          aborted: false,
+          previewUrl: null,
+          reason: `no vercel preview URL available (state=${failureState}); cannot run fixup agent`,
+        };
+      }
+
+      let buildLog = "";
+      try {
+        buildLog = await fetchBuildLogs(previewUrl);
+        this.store.recordEvent(issue.id, "preview_build_log_captured", {
+          attempt,
+          previewUrl,
+          bytes: buildLog.length,
+        });
+      } catch (err) {
+        this.logger.warn(
+          { err, previewUrl },
+          "failed to fetch vercel build logs; spawning fixup with empty log",
+        );
+        this.store.recordEvent(issue.id, "preview_build_log_failed", {
+          attempt,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      try {
+        const c = await this.plane.postComment(
+          issue.id,
+          `<p><strong>Vercel preview build failed</strong> on <code>${escapeHtml(sha.slice(0, 12))}</code> (state: <code>${escapeHtml(failureState)}</code>). Spawning fixup agent — attempt ${attempt}/${cap}. <a href="${escapeHtml(previewUrl)}">Vercel logs</a>.</p>`,
+        );
+        this.store.advanceCommentWatermark(issue.id, c.createdAt);
+      } catch {
+        // best-effort
+      }
+
+      const detail = await this.plane.retrieveIssue(issue.id);
+      const aborter = this.registerStageAbort(issue.id);
+      let fixupResult;
+      try {
+        fixupResult = await this.builder.fixup({
+          issue: detail,
+          branch: planResult.branch,
+          worktreePath: planResult.worktreePath,
+          planRelPath: planResult.planPath,
+          previewUrl,
+          buildLog,
+          attemptNumber: attempt,
+          priorFailures,
+          signal: aborter.signal,
+        });
+      } finally {
+        aborter.release();
+      }
+
+      if (fixupResult.aborted) {
+        return { ok: false, aborted: true, previewUrl: null };
+      }
+
+      if (!fixupResult.advancedHead) {
+        // Agent gave up without producing a commit. No new SHA means a re-poll
+        // would just see the same failure — terminate this loop.
+        return {
+          ok: false,
+          aborted: false,
+          previewUrl,
+          reason: `fixup attempt ${attempt} produced no commit (verdict: ${fixupResult.verdict || "n/a"})`,
+        };
+      }
+
+      // Carry context forward for the next attempt's prompt.
+      priorFailures = `## Fixup attempt ${attempt} (verdict: ${fixupResult.verdict || "n/a"})\n\nThe build log above produced commit ${fixupResult.newHeadSha.slice(0, 12)}, but the new build will be checked on the next loop. If you see the same root cause repeat, the previous fix did not address it.`;
+      sha = fixupResult.pushedSha ?? fixupResult.newHeadSha;
     }
   }
 

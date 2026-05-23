@@ -34,10 +34,8 @@ export interface Config {
     protectionBypass: string | null;
     /** Max time to wait for a preview deployment to reach a terminal state. */
     readyTimeoutMs: number;
-    /** Phase 5 (slice 5a): hard cap on preview-build retries before failing. */
-    maxPreviewRetries: number;
-    /** How long to wait between preview-retry attempts. */
-    retryPauseMs: number;
+    /** Phase 5 (slice 5a-v2): cap on fixup-session attempts after a failed Vercel build. */
+    maxPreviewFixupAttempts: number;
   };
   e2e: {
     /** Hard timeout per E2E Claude session. */
@@ -125,8 +123,7 @@ export function loadConfig(): Config {
     vercel: {
       protectionBypass: optional("VERCEL_PROTECTION_BYPASS", "") || null,
       readyTimeoutMs: int("VERCEL_READY_TIMEOUT_MS", 10 * 60_000),
-      maxPreviewRetries: int("MAX_PREVIEW_RETRIES", 3),
-      retryPauseMs: int("VERCEL_RETRY_PAUSE_MS", 20_000),
+      maxPreviewFixupAttempts: int("MAX_PREVIEW_FIXUP_ATTEMPTS", 3),
     },
     e2e: {
       timeoutMs: int("E2E_TIMEOUT_MS", 20 * 60_000),

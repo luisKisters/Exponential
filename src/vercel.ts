@@ -168,6 +168,60 @@ function ghApi(path: string): Promise<unknown> {
 }
 
 /**
+ * Pull build logs for a failed Vercel preview via `npx vercel inspect --logs`.
+ * The CLI uses local keyring auth (no token needed for the dev story); for
+ * Phase 8 / Docker we'll set VERCEL_TOKEN and pass `--token $VERCEL_TOKEN`.
+ *
+ * Returns a trimmed tail (`maxBytes`, default 50 KB) of stdout+stderr — enough
+ * for an agent to diagnose root cause without blowing the prompt budget.
+ */
+export function fetchBuildLogs(
+  previewUrl: string,
+  options: { maxBytes?: number; timeoutMs?: number } = {},
+): Promise<string> {
+  const maxBytes = options.maxBytes ?? 50 * 1024;
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  return new Promise((resolve, reject) => {
+    const args = ["-y", "vercel@latest", "inspect", "--logs", previewUrl];
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (process.env["VERCEL_TOKEN"]) {
+      args.push("--token", process.env["VERCEL_TOKEN"]);
+    }
+    const child = spawn("npx", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+    });
+    let out = "";
+    const append = (chunk: Buffer | string): void => {
+      out += chunk.toString();
+      if (out.length > maxBytes * 2) {
+        out = out.slice(out.length - maxBytes);
+      }
+    };
+    child.stdout.on("data", append);
+    child.stderr.on("data", append);
+    const killer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // best-effort
+      }
+    }, timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(killer);
+      reject(err);
+    });
+    child.on("close", () => {
+      clearTimeout(killer);
+      const trimmed = out.length > maxBytes ? out.slice(out.length - maxBytes) : out;
+      // We don't care about exit code — even on a failed deployment, the CLI
+      // exits 0 and the log content is what we want.
+      resolve(trimmed);
+    });
+  });
+}
+
+/**
  * Derive "owner/repo" from a git remote URL. Supports both SSH and HTTPS.
  * Used as a fallback when SUMMARIO_GITHUB_REPO is not explicitly set.
  */

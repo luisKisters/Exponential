@@ -332,12 +332,22 @@ This phase exists because Phase 4's first end-to-end run surfaced three real pro
 - Confirm `memory.md` is the only narrative file on the branch — no `progress.md`, no `failures.md`.
 - Confirm this phase's commits appear in `origin/main` as separate `feat(phase-5): …` commits, not one mega-commit.
 
-**Shipped in slice 5a (Vercel retriable resource — this commit):**
+**Shipped in slice 5a-v2 (Vercel build-failure fixup loop — this commit):**
 
-- `preview_retry_count` column + `MAX_PREVIEW_RETRIES` cap (default 3).
-- On Vercel preview failure (`state !== "success"` or no URL): increment counter, post a "preview build failed (attempt N/MAX), retrying" comment, leave SQLite status at `built`, return without finishing the pipeline. The next poll cycle's restart-recovery path re-enters at the preview-wait/e2e stage.
-- On cap exhausted: transition to Failed with `last_error = "vercel preview failed N time(s)"`.
-- The Vercel-CLI switch, `memory.md` consolidation, and per-phase-commit workflow are still deferred — captured as slices 5b/5c/5d for later turns.
+The original slice 5a treated a failed Vercel preview as a retriable resource and just re-polled the same SHA on a timer. That's nonsense — the same code can't build twice. A test run produced 800+ poll attempts and the matching count of Plane spam comments before the cap (intermittently undefined due to a config race) finally fired. **Slice 5a-v2 replaces this with an agent-driven fixup loop.**
+
+- `preview_fixup_attempt_count` column + `MAX_PREVIEW_FIXUP_ATTEMPTS` cap (default 3, env-tunable). Renamed from the previous `preview_retry_count` / `MAX_PREVIEW_RETRIES`. The old `VERCEL_RETRY_PAUSE_MS` is removed — there's actual agent work between attempts, no sleep needed.
+- On Vercel preview failure (`state !== "success"`), the orchestrator:
+  1. Calls `npx vercel inspect --logs <preview-url>` and captures the tail (~50 KB) as the build log.
+  2. Posts **one** Plane comment per fixup attempt (not per poll): `"Vercel preview build failed on <sha> (state: failure). Spawning fixup agent — attempt N/MAX."`.
+  3. Spawns a fresh Claude session in the worktree with a dedicated `buildFixup` prompt (`src/prompts/buildFixup.ts`). The prompt embeds the build log, points the agent at `plan.md` + `progress.md` + recent commits, and instructs it to diagnose the root cause, fix the code, run `pnpm build` locally to confirm green, commit (`fix(PLANE-N): vercel build attempt M — <cause>`), and exit. No push, no Plane calls, no scope expansion.
+  4. After the session ends with verdict `fixup-ok`, the orchestrator commits any leftover `failures.md` notes, checks that HEAD actually advanced, and pushes the branch. Vercel auto-redeploys on the new SHA; the loop re-enters `waitForPreview` with the new SHA.
+- Terminal failures:
+  - Cap exhausted: `last_error = "vercel preview failed after N fixup attempt(s)"`.
+  - Fixup verdict is `fixup-failed` or HEAD didn't advance: terminate immediately, since a fresh poll would just see the same failure on the same SHA.
+  - No preview URL available (Vercel never registered a deployment): terminate — we have no log to give the agent, so there's no productive fixup to attempt.
+- Reviewer-feedback abort (Phase 4.5) is honored throughout: the fixup session is spawned with an `AbortSignal` and a reviewer comment kills the in-flight session, drops back to the `plan` stage with the feedback folded in.
+- The Vercel-CLI switch (full deploy via CLI, not just log retrieval), `memory.md` consolidation, and per-phase-commit workflow are still deferred — captured as slices 5b/5c/5d for later turns.
 
 ---
 

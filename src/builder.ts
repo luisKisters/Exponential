@@ -14,6 +14,7 @@ import {
 import type { PlaneApi, PlaneIssueDetail } from "./plane.js";
 import { findAvailablePort } from "./ports.js";
 import { buildBuildingPrompt } from "./prompts/building.js";
+import { buildFixupPrompt } from "./prompts/buildFixup.js";
 import type { Store } from "./store.js";
 
 export interface BuildInput {
@@ -39,6 +40,40 @@ export interface BuildResult {
   tickResult: TickResult | null;
   /** True if the build was interrupted by reviewer feedback. */
   aborted: boolean;
+}
+
+export interface FixupInput {
+  issue: PlaneIssueDetail;
+  branch: string;
+  worktreePath: string;
+  planRelPath: string;
+  /** Vercel deployment URL whose build failed. */
+  previewUrl: string;
+  /** Captured build log (tail). */
+  buildLog: string;
+  /** 1-indexed fixup attempt number. */
+  attemptNumber: number;
+  /** Accumulated notes from prior fixup attempts (empty for attempt 1). */
+  priorFailures: string;
+  /** Optional abort signal for reviewer-feedback interruption. */
+  signal?: AbortSignal;
+}
+
+export interface FixupResult {
+  /** True if the agent reported fixup-ok AND advanced HEAD. */
+  ok: boolean;
+  /** True if Claude reported done.flag at all. */
+  doneFlagSeen: boolean;
+  /** True if reviewer feedback aborted the session mid-flight. */
+  aborted: boolean;
+  /** Verdict word read from done.flag (`fixup-ok` | `fixup-failed` | other). */
+  verdict: string;
+  /** HEAD sha after the session (and orchestrator's leftover-files commit). */
+  newHeadSha: string;
+  /** True if `newHeadSha` differs from the pre-fixup sha. */
+  advancedHead: boolean;
+  /** Pushed-to-remote sha (or null if push failed / nothing to push). */
+  pushedSha: string | null;
 }
 
 export interface PhaseOutcome {
@@ -347,6 +382,142 @@ export class Builder {
       phases,
       tickResult,
       aborted: false,
+    };
+  }
+
+  /**
+   * Phase 5 slice 5a-v2: spawn a fresh Claude session that reads a failed
+   * Vercel build log and fixes the offending code, then commits. The
+   * orchestrator pushes the resulting branch so Vercel re-deploys.
+   *
+   * Unlike `build()`, this doesn't start a dev server (irrelevant for
+   * build-failures) and doesn't retry within a single session (the
+   * orchestrator-level loop with MAX_PREVIEW_FIXUP_ATTEMPTS does that).
+   */
+  async fixup(input: FixupInput): Promise<FixupResult> {
+    const { issue, branch, worktreePath, planRelPath, previewUrl, buildLog, attemptNumber, priorFailures, signal } = input;
+    const shortId = `PLANE-${issue.sequenceId}`;
+
+    const issueDir = join(worktreePath, ".agent", "issues", issue.id);
+    await mkdir(issueDir, { recursive: true });
+
+    const progressAbs = join(issueDir, "progress.md");
+    const failuresAbs = join(issueDir, "failures.md");
+    const doneFlagAbs = join(issueDir, "done.flag");
+
+    // Re-link node_modules / .env if the worktree lost them between runs.
+    await linkRepoArtifacts(this.logger, {
+      sourceRepo: this.config.summario.repoPath,
+      worktreePath,
+    });
+
+    if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
+
+    const preSha = await this.git.headSha(worktreePath);
+
+    const prompt = buildFixupPrompt({
+      workItemId: issue.id,
+      shortId,
+      sequenceId: issue.sequenceId,
+      title: issue.name,
+      descriptionText: issue.descriptionText,
+      branch,
+      planRelPath,
+      progressRelPath: relative(worktreePath, progressAbs),
+      failuresRelPath: relative(worktreePath, failuresAbs),
+      doneFlagRelPath: relative(worktreePath, doneFlagAbs),
+      attemptNumber,
+      previewUrl,
+      buildLog,
+      priorFailures,
+    });
+
+    this.store.recordEvent(issue.id, "fixup_session_started", {
+      attempt: attemptNumber,
+      promptLength: prompt.length,
+      preSha,
+      buildLogBytes: buildLog.length,
+    });
+
+    const result = await this.claude.run({
+      cwd: worktreePath,
+      prompt,
+      doneFlagPath: doneFlagAbs,
+      timeoutMs: this.config.claude.timeoutMs,
+      binary: this.config.claude.binary,
+      extraArgs: this.config.claude.extraArgs,
+      signal,
+    });
+
+    this.store.recordEvent(issue.id, "fixup_session_finished", {
+      attempt: attemptNumber,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      doneFlagSeen: result.doneFlagSeen,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
+    });
+
+    if (result.aborted) {
+      if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
+      return {
+        ok: false,
+        doneFlagSeen: result.doneFlagSeen,
+        aborted: true,
+        verdict: "aborted",
+        newHeadSha: preSha,
+        advancedHead: false,
+        pushedSha: null,
+      };
+    }
+
+    const flagContent = await safeRead(doneFlagAbs);
+    const verdict = (flagContent ?? "").trim().split(/\s+/)[0] ?? "";
+    if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
+
+    // Commit any leftover agent files (failures.md was almost certainly
+    // appended; progress.md may have been touched too). The agent's own
+    // code commit is already in place.
+    await this.git.commitAll(
+      worktreePath,
+      `chore(fixup): record fixup attempt ${attemptNumber} for ${shortId}`,
+    );
+
+    const newHeadSha = await this.git.headSha(worktreePath);
+    const advancedHead = newHeadSha !== preSha;
+
+    let pushedSha: string | null = null;
+    if (advancedHead) {
+      try {
+        await this.git.push(
+          worktreePath,
+          this.config.summario.remoteName,
+          branch,
+        );
+        pushedSha = newHeadSha;
+        this.store.recordEvent(issue.id, "fixup_branch_pushed", {
+          attempt: attemptNumber,
+          branch,
+          headSha: newHeadSha,
+        });
+      } catch (err) {
+        this.logger.error({ err, branch }, "git push (after fixup) failed");
+        this.store.recordEvent(issue.id, "fixup_push_failed", {
+          attempt: attemptNumber,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const ok = verdict === "fixup-ok" && advancedHead;
+    return {
+      ok,
+      doneFlagSeen: result.doneFlagSeen,
+      aborted: false,
+      verdict,
+      newHeadSha,
+      advancedHead,
+      pushedSha,
     };
   }
 

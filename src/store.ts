@@ -47,7 +47,7 @@ export interface IssueRow {
   /** Reviewer feedback text waiting to be folded into the next planning loop. */
   pending_feedback: string | null;
   /** How many times we've retried a failed Vercel preview deploy for this issue. */
-  preview_retry_count: number;
+  preview_fixup_attempt_count: number;
 }
 
 export interface PickupInsert {
@@ -116,7 +116,7 @@ export class Store {
       "last_seen_comment_at TEXT",
       "pending_feedback TEXT",
       // Phase 5 (slice 5a) — Vercel preview retriable resource.
-      "preview_retry_count INTEGER NOT NULL DEFAULT 0",
+      "preview_fixup_attempt_count INTEGER NOT NULL DEFAULT 0",
     ];
     for (const col of extraColumns) {
       try {
@@ -199,7 +199,7 @@ export class Store {
                attempts = attempts + 1,
                last_seen_comment_at = ?,
                pending_feedback = NULL,
-               preview_retry_count = 0
+               preview_fixup_attempt_count = 0
          WHERE plane_work_item_id = ?`,
       );
       update.run(
@@ -470,26 +470,26 @@ export class Store {
   }
 
   /**
-   * After a successful Vercel preview retry exhaustion, the orchestrator wants
-   * to know "have we tried N times yet". `incrementPreviewRetry` returns the
-   * new count.
+   * Phase 5 slice 5a-v2: increment after spawning a fixup session for a
+   * failed Vercel preview. Returns the new count so the orchestrator can
+   * compare against MAX_PREVIEW_FIXUP_ATTEMPTS.
    */
-  incrementPreviewRetry(workItemId: string): number {
+  incrementPreviewFixupAttempt(workItemId: string): number {
     const tx = this.db.transaction((id: string): number => {
       this.db.prepare(
-        `UPDATE issues SET preview_retry_count = preview_retry_count + 1, updated_at = ? WHERE plane_work_item_id = ?`,
+        `UPDATE issues SET preview_fixup_attempt_count = preview_fixup_attempt_count + 1, updated_at = ? WHERE plane_work_item_id = ?`,
       ).run(new Date().toISOString(), id);
       const row = this.db.prepare(
-        `SELECT preview_retry_count FROM issues WHERE plane_work_item_id = ?`,
-      ).get(id) as { preview_retry_count: number } | undefined;
-      return row?.preview_retry_count ?? 0;
+        `SELECT preview_fixup_attempt_count FROM issues WHERE plane_work_item_id = ?`,
+      ).get(id) as { preview_fixup_attempt_count: number } | undefined;
+      return row?.preview_fixup_attempt_count ?? 0;
     });
     return tx(workItemId);
   }
 
-  resetPreviewRetry(workItemId: string): void {
+  resetPreviewFixupAttempts(workItemId: string): void {
     this.db.prepare(
-      `UPDATE issues SET preview_retry_count = 0, updated_at = ? WHERE plane_work_item_id = ?`,
+      `UPDATE issues SET preview_fixup_attempt_count = 0, updated_at = ? WHERE plane_work_item_id = ?`,
     ).run(new Date().toISOString(), workItemId);
   }
 
