@@ -16,6 +16,7 @@ import type { IssueRow, Store } from "./store.js";
 import {
   deriveGhRepo,
   fetchBuildLogs,
+  looksLikeInfraFailure,
   waitForPreview,
   type PreviewResult,
 } from "./vercel.js";
@@ -875,6 +876,37 @@ export class Orchestrator {
           attempt,
           error: err instanceof Error ? err.message : String(err),
         });
+      }
+
+      // Infra short-circuit: a missing env var / bad deploy key can't be fixed
+      // from inside the worktree, so don't waste fixup attempts (or a Claude
+      // session) on it — fail fast with a reviewer-actionable reason.
+      const infra = looksLikeInfraFailure(buildLog);
+      if (infra.infra) {
+        this.logger.warn(
+          { previewUrl, signature: infra.signature },
+          "vercel build failure looks like infra/config, not code; skipping fixup",
+        );
+        this.store.recordEvent(issue.id, "preview_fixup_infra_skip", {
+          attempt,
+          signature: infra.signature,
+          previewUrl,
+        });
+        try {
+          const c = await this.plane.postComment(
+            issue.id,
+            `<p><strong>Vercel preview build failed</strong> on <code>${escapeHtml(sha.slice(0, 12))}</code>, and the log looks like an <strong>infrastructure/config problem</strong> (matched <code>${escapeHtml(infra.signature ?? "")}</code>) rather than a code defect. Not spawning a fixup agent — this needs a human (likely a Vercel env var). <a href="${escapeHtml(previewUrl)}">Vercel logs</a>.</p>`,
+          );
+          this.store.advanceCommentWatermark(issue.id, c.createdAt);
+        } catch {
+          // best-effort
+        }
+        return {
+          ok: false,
+          aborted: false,
+          previewUrl,
+          reason: `vercel build failed on infra/config (matched "${infra.signature}"); not a code defect — needs a human`,
+        };
       }
 
       try {

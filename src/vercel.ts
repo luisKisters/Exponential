@@ -221,6 +221,49 @@ export function fetchBuildLogs(
   });
 }
 
+export interface InfraFailureMatch {
+  /** True if the build log looks like an infra/config problem, not a code defect. */
+  infra: boolean;
+  /** The signature that matched (for logging / the Plane comment), or null. */
+  signature: string | null;
+}
+
+/**
+ * Heuristic: does this Vercel build log describe an *infrastructure* failure
+ * (missing env var, bad deploy key, project misconfig) rather than a code
+ * defect a fixup agent could repair from inside the worktree?
+ *
+ * When true, the orchestrator short-circuits the fixup loop — spawning a
+ * Claude session to "fix" a missing CONVEX_DEPLOY_KEY just wastes attempts,
+ * since the fix lives in Vercel's dashboard, not the code.
+ *
+ * Deliberately conservative: only flag signatures we're confident are infra.
+ * A false negative (treating infra as code) just wastes one fixup attempt; a
+ * false positive (treating a real code bug as infra) skips a fix we could
+ * have made, which is worse.
+ */
+export function looksLikeInfraFailure(buildLog: string): InfraFailureMatch {
+  if (!buildLog) return { infra: false, signature: null };
+  const signatures = [
+    "no Convex deployment configuration found",
+    "CONVEX_DEPLOY_KEY",
+    "CONVEX_SELF_HOSTED_URL",
+    "Environment Variable", // Vercel: "Environment Variable X references Secret Y, which does not exist"
+    "references Secret",
+    "Missing required environment variable",
+    "The specified token is not valid",
+    "You do not have permission",
+    "Not authorized to access",
+    "Invalid token",
+  ];
+  for (const sig of signatures) {
+    if (buildLog.includes(sig)) {
+      return { infra: true, signature: sig };
+    }
+  }
+  return { infra: false, signature: null };
+}
+
 /**
  * Derive "owner/repo" from a git remote URL. Supports both SSH and HTTPS.
  * Used as a fallback when SUMMARIO_GITHUB_REPO is not explicitly set.

@@ -14,7 +14,7 @@ import {
   planMarkdownToHtml,
   tickAcceptanceCriteria,
 } from "../src/planeDescription.ts";
-import { deriveGhRepo } from "../src/vercel.ts";
+import { deriveGhRepo, looksLikeInfraFailure } from "../src/vercel.ts";
 
 let failures = 0;
 
@@ -188,6 +188,26 @@ console.log("\n== deriveGhRepo ==");
   check("ssh form", deriveGhRepo("git@github.com:foo/bar.git") === "foo/bar");
   check("trailing whitespace", deriveGhRepo("  https://github.com/foo/bar  ") === "foo/bar");
   check("non-github → null", deriveGhRepo("git@gitlab.com:foo/bar.git") === null);
+}
+
+console.log("\n== looksLikeInfraFailure ==");
+{
+  const convexLog = "Running 'npx convex deploy'\n✖ Vercel build environment detected but no Convex deployment configuration found.\nSet CONVEX_DEPLOY_KEY for Convex Cloud deployments";
+  check("convex deploy key → infra", looksLikeInfraFailure(convexLog).infra === true);
+  check("convex match reports signature",
+    looksLikeInfraFailure(convexLog).signature !== null);
+
+  const codeLog = "Type error: Property 'foo' does not exist on type 'Bar'.\n./components/X.tsx:42:10";
+  check("type error → not infra", looksLikeInfraFailure(codeLog).infra === false);
+  check("type error signature null", looksLikeInfraFailure(codeLog).signature === null);
+
+  const secretLog = "Error: Environment Variable \"API_KEY\" references Secret \"api-key\", which does not exist.";
+  check("missing secret → infra", looksLikeInfraFailure(secretLog).infra === true);
+
+  const tokenLog = "Error: The specified token is not valid. Use `vercel login`.";
+  check("bad token → infra", looksLikeInfraFailure(tokenLog).infra === true);
+
+  check("empty log → not infra", looksLikeInfraFailure("").infra === false);
 }
 
 console.log("");
