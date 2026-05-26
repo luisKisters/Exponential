@@ -4,6 +4,7 @@ import { join, relative } from "node:path";
 import { ClaudeSession } from "./claude.js";
 import type { Config } from "./config.js";
 import type { Logger } from "./logger.js";
+import { ensureMemoryFile } from "./memory.js";
 import type { PlaneIssueDetail } from "./plane.js";
 import { buildE2ePrompt } from "./prompts/e2e.js";
 import type { Store } from "./store.js";
@@ -29,8 +30,8 @@ export interface E2eResult {
   timedOut: boolean;
   /** Path (repo-rel) to the verdict file. */
   verdictRelPath: string;
-  /** Path (repo-rel) to the failures notes (may not exist). */
-  failuresRelPath: string;
+  /** Path (repo-rel) to the per-issue memory log. */
+  memoryRelPath: string;
   /** True if the session was interrupted by reviewer feedback. */
   aborted: boolean;
 }
@@ -59,10 +60,11 @@ export class E2eRunner {
     const issueDir = join(worktreePath, ".agent", "issues", issue.id);
     await mkdir(issueDir, { recursive: true });
 
-    const progressAbs = join(issueDir, "progress.md");
-    const failuresAbs = join(issueDir, "failures.md");
+    const memoryAbs = join(issueDir, "memory.md");
     const verdictAbs = join(issueDir, "verdict.txt");
     const doneFlagAbs = join(issueDir, "done.flag");
+
+    await ensureMemoryFile(memoryAbs, `PLANE-${issue.sequenceId}`);
 
     // Clear stale signals from previous loops.
     for (const p of [doneFlagAbs, verdictAbs]) {
@@ -79,8 +81,7 @@ export class E2eRunner {
       previewUrl,
       vercelBypass: this.config.vercel.protectionBypass,
       mockUser: this.config.mockUser,
-      progressRelPath: relative(worktreePath, progressAbs),
-      failuresRelPath: relative(worktreePath, failuresAbs),
+      memoryRelPath: relative(worktreePath, memoryAbs),
       doneFlagRelPath: relative(worktreePath, doneFlagAbs),
       verdictRelPath: relative(worktreePath, verdictAbs),
       loopNumber,
@@ -123,7 +124,7 @@ export class E2eRunner {
       doneFlagSeen: result.doneFlagSeen,
       timedOut: result.timedOut,
       verdictRelPath: relative(worktreePath, verdictAbs),
-      failuresRelPath: relative(worktreePath, failuresAbs),
+      memoryRelPath: relative(worktreePath, memoryAbs),
       aborted: result.aborted,
     };
   }

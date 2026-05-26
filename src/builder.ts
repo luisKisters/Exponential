@@ -1,19 +1,20 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, symlink } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { ClaudeSession, type ClaudeSessionResult } from "./claude.js";
+import { ClaudeSession } from "./claude.js";
 import type { Config } from "./config.js";
-import { startDevServer, type DevServerHandle } from "./devServer.js";
 import { Git } from "./git.js";
 import type { Logger } from "./logger.js";
+import { appendMemorySection, ensureMemoryFile, formatPhaseSection } from "./memory.js";
+import { parseAcList, parsePlanPhases } from "./plan.js";
 import {
   injectPlanFence,
   tickAcceptanceCriteria,
   type TickResult,
 } from "./planeDescription.js";
 import type { PlaneApi, PlaneIssueDetail } from "./plane.js";
-import { findAvailablePort } from "./ports.js";
-import { buildBuildingPrompt } from "./prompts/building.js";
+import { runPnpmBuild } from "./pnpm.js";
+import { buildPhasePrompt } from "./prompts/buildPhase.js";
 import { buildFixupPrompt } from "./prompts/buildFixup.js";
 import type { Store } from "./store.js";
 
@@ -29,12 +30,13 @@ export interface BuildInput {
 }
 
 export interface BuildResult {
-  /** True if the agent reported all phases complete. */
+  /** True if every plan phase completed. */
   ok: boolean;
+  /** Total per-phase Claude sessions spawned across all phases. */
   attempts: number;
   /** Final HEAD sha pushed to remote (or null if nothing was pushed). */
   headSha: string | null;
-  /** Phase outcomes parsed from progress.md. */
+  /** Per-phase outcomes (one entry per phase the build stage reached). */
   phases: PhaseOutcome[];
   /** AC ticking result against the Plane description. */
   tickResult: TickResult | null;
@@ -114,77 +116,82 @@ export class Builder {
     this.claude = new ClaudeSession(logger);
   }
 
+  /**
+   * Phase 6: implement the plan one phase at a time, each in its own fresh
+   * Claude session sharing state through memory.md. The orchestrator (not the
+   * agent) runs the authoritative `pnpm build`, writes the uniform per-phase
+   * memory section, and commits each phase. A failed phase is retried in a
+   * fresh session up to PHASE_MAX_ATTEMPTS; if it still fails the build stage
+   * stops (later phases are not started).
+   */
   async build(input: BuildInput): Promise<BuildResult> {
     const { issue, branch, worktreePath, planRelPath, signal } = input;
     const shortId = `PLANE-${issue.sequenceId}`;
 
     this.store.markBuilding(issue.id);
-    this.store.recordEvent(issue.id, "building_started", {
-      branch,
-      worktreePath,
-    });
+    this.store.recordEvent(issue.id, "building_started", { branch, worktreePath });
 
     const issueDir = join(worktreePath, ".agent", "issues", issue.id);
     await mkdir(issueDir, { recursive: true });
 
-    const progressAbs = join(issueDir, "progress.md");
-    const failuresAbs = join(issueDir, "failures.md");
+    const memoryAbs = join(issueDir, "memory.md");
     const summaryAbs = join(issueDir, "summary.md");
     const doneFlagAbs = join(issueDir, "done.flag");
+    const reportAbs = join(issueDir, "phase-report.md");
 
-    // Fresh signal: clear the done flag from any previous run. Keep progress
-    // and failures around — the agent can read its own history.
-    if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
+    // Clear transient signals from any previous run. memory.md persists — it's
+    // the cross-session narrative.
+    for (const p of [doneFlagAbs, reportAbs]) {
+      if (existsSync(p)) await rm(p);
+    }
 
-    // Best-effort: link .env and node_modules from the source repo into the
-    // worktree so `pnpm build` / `pnpm dev` can run without a fresh install.
+    // Best-effort: link .env and node_modules so `pnpm build` runs without a
+    // fresh install (used by both the agent sessions and our build gate).
     await linkRepoArtifacts(this.logger, {
       sourceRepo: this.config.summario.repoPath,
       worktreePath,
     });
 
-    // Optionally start a dev server. We treat this as best-effort: if it
-    // doesn't come up, the agent is told it's unavailable and falls back to
-    // build-only verification.
-    let devServer: DevServerHandle | null = null;
-    if (this.config.builder.devServer !== "off") {
-      try {
-        const port = await findAvailablePort(this.config.builder.devServerBasePort);
-        devServer = await startDevServer(this.logger, {
-          cwd: worktreePath,
-          port,
-        });
-        this.store.recordEvent(issue.id, "dev_server_ready", {
-          port: devServer.port,
-          url: devServer.url,
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.logger.warn(
-          { err, worktreePath },
-          "dev server failed to start; continuing without it",
-        );
-        this.store.recordEvent(issue.id, "dev_server_failed", {
-          error: message,
-        });
-        if (this.config.builder.devServer === "required") {
-          throw new BuildingError(
-            `dev server required but failed to start: ${message}`,
-            { worktreePath, branch, transcript: "" },
-          );
-        }
-      }
+    await ensureMemoryFile(memoryAbs, shortId);
+
+    const planAbs = join(issueDir, "plan.md");
+    const planMarkdown =
+      (await safeRead(planAbs)) ??
+      (await safeRead(join(this.config.summario.repoPath, planRelPath))) ??
+      (await safeRead(join(worktreePath, planRelPath))) ??
+      "";
+    const planPhases = parsePlanPhases(planMarkdown);
+
+    if (planPhases.length === 0) {
+      const reason = "plan.md has no recognisable \"## Phase N\" headings to build";
+      this.store.markBuildFailed(issue.id, reason);
+      this.store.recordEvent(issue.id, "building_failed", { reason });
+      return { ok: false, attempts: 0, headSha: null, phases: [], tickResult: null, aborted: false };
     }
 
-    let attempt = 0;
-    let lastResult: ClaudeSessionResult | null = null;
-    let priorFailures = "";
-    let ok = false;
+    const memoryRelPath = relative(worktreePath, memoryAbs);
+    const reportRelPath = relative(worktreePath, reportAbs);
+    const doneFlagRelPath = relative(worktreePath, doneFlagAbs);
 
-    try {
-      while (attempt < this.config.builder.maxAttempts) {
+    const outcomes: PhaseOutcome[] = [];
+    let aborted = false;
+    let buildFailed = false;
+
+    for (const phase of planPhases) {
+      let attempt = 0;
+      let phaseOk = false;
+      let priorPhaseFailures = "";
+      let reportNotes = "";
+      let reportBrowser: PhaseOutcome["browserCheck"] = "skipped";
+
+      while (attempt < this.config.builder.phaseMaxAttempts) {
         attempt++;
-        const prompt = buildBuildingPrompt({
+        for (const p of [doneFlagAbs, reportAbs]) {
+          if (existsSync(p)) await rm(p);
+        }
+
+        const sessionStartedAt = new Date().toISOString();
+        const prompt = buildPhasePrompt({
           workItemId: issue.id,
           shortId,
           sequenceId: issue.sequenceId,
@@ -192,108 +199,192 @@ export class Builder {
           descriptionText: issue.descriptionText,
           branch,
           planRelPath,
-          progressRelPath: relative(worktreePath, progressAbs),
-          failuresRelPath: relative(worktreePath, failuresAbs),
-          doneFlagRelPath: relative(worktreePath, doneFlagAbs),
-          summaryRelPath: relative(worktreePath, summaryAbs),
-          devServerUrl: devServer?.url ?? null,
+          memoryRelPath,
+          phaseReportRelPath: reportRelPath,
+          doneFlagRelPath,
+          phaseIndex: phase.index,
+          totalPhases: planPhases.length,
+          phaseTitle: phase.title,
+          phaseBody: phase.body,
+          satisfiesAcRaw: phase.satisfiesAcRaw,
           attemptNumber: attempt,
-          priorFailures,
+          priorFailures: priorPhaseFailures,
         });
 
-        this.store.recordEvent(issue.id, "build_attempt_started", {
+        this.store.recordEvent(issue.id, "build_phase_session_started", {
+          phase: phase.index,
+          totalPhases: planPhases.length,
           attempt,
+          sessionStartedAt,
           promptLength: prompt.length,
         });
 
-        lastResult = await this.claude.run({
+        const result = await this.claude.run({
           cwd: worktreePath,
           prompt,
           doneFlagPath: doneFlagAbs,
-          timeoutMs: this.config.claude.timeoutMs,
+          timeoutMs: this.config.builder.phaseTimeoutMs,
           binary: this.config.claude.binary,
           extraArgs: this.config.claude.extraArgs,
           signal,
         });
 
-        this.store.recordEvent(issue.id, "build_attempt_finished", {
+        const verdictRaw = (await safeRead(doneFlagAbs)) ?? "";
+        const verdict = verdictRaw.trim().split(/\s+/)[0] ?? "";
+
+        this.store.recordEvent(issue.id, "build_phase_session_finished", {
+          phase: phase.index,
           attempt,
-          exitCode: lastResult.exitCode,
-          signal: lastResult.signal,
-          doneFlagSeen: lastResult.doneFlagSeen,
-          timedOut: lastResult.timedOut,
-          aborted: lastResult.aborted,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          doneFlagSeen: result.doneFlagSeen,
+          timedOut: result.timedOut,
+          aborted: result.aborted,
+          verdict,
         });
 
-        // Reviewer interrupted us — stop the retry loop immediately so the
-        // orchestrator can re-plan with the feedback included.
-        if (lastResult.aborted) break;
-
-        const flagContent = await safeRead(doneFlagAbs);
-        const verdict = (flagContent ?? "").trim().split(/\s+/)[0] ?? "";
-
-        if (lastResult.doneFlagSeen && verdict === "build-ok") {
-          ok = true;
+        // Reviewer interrupted us — stop everything so the orchestrator can
+        // re-plan with the feedback included.
+        if (result.aborted) {
+          aborted = true;
           break;
         }
 
-        const failuresSoFar = await safeRead(failuresAbs);
-        const progressSoFar = await safeRead(progressAbs);
-        priorFailures = `## Attempt ${attempt} (${verdict || "no-verdict"})\n\nfailures.md so far:\n\n${(failuresSoFar ?? "(empty)").slice(0, 8_000)}\n\nprogress.md so far:\n\n${(progressSoFar ?? "(empty)").slice(0, 8_000)}`;
+        const report = await safeRead(reportAbs);
+        if (report) {
+          reportNotes = matchField(report, "Notes") ?? reportNotes;
+          const bc = matchField(report, "Browser check");
+          if (bc) reportBrowser = parseBrowserCheck(bc);
+        }
 
-        // Tear down done.flag so the next iteration starts cleanly.
-        if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
+        if (result.doneFlagSeen && verdict === "phase-ok") {
+          // The agent claims success — confirm with our own authoritative build.
+          this.store.recordEvent(issue.id, "build_phase_build_started", {
+            phase: phase.index,
+            attempt,
+          });
+          const buildRes = await runPnpmBuild(worktreePath, this.config.builder.buildTimeoutMs);
+          this.store.recordEvent(issue.id, "build_phase_build_finished", {
+            phase: phase.index,
+            attempt,
+            ok: buildRes.ok,
+            exitCode: buildRes.exitCode,
+            timedOut: buildRes.timedOut,
+          });
+          if (buildRes.ok) {
+            phaseOk = true;
+          } else {
+            const tail = buildRes.output.slice(-6_000);
+            priorPhaseFailures += `\n\n### Attempt ${attempt}: agent reported phase-ok but the orchestrator's \`pnpm build\` FAILED\n\n\`\`\`\n${tail}\n\`\`\``;
+            await appendMemorySection(
+              memoryAbs,
+              `### Phase ${phase.index} attempt ${attempt} — orchestrator build failed\n\n\`pnpm build\` did not pass after the agent reported phase-ok:\n\n\`\`\`\n${buildRes.output.slice(-4_000)}\n\`\`\``,
+            );
+          }
+        } else {
+          const reason = !result.doneFlagSeen
+            ? result.timedOut
+              ? "session timed out before writing done.flag"
+              : "session exited before writing done.flag"
+            : `agent verdict: ${verdict || "none"}`;
+          priorPhaseFailures += `\n\n### Attempt ${attempt}: ${reason}\n\n${(reportNotes || "(no report)").slice(0, 2_000)}`;
+          await appendMemorySection(
+            memoryAbs,
+            `### Phase ${phase.index} attempt ${attempt} — failed (${reason})\n\n${(reportNotes || "(no agent report)").slice(0, 2_000)}`,
+          );
+        }
 
-        if (attempt >= this.config.builder.maxAttempts) break;
+        for (const p of [doneFlagAbs, reportAbs]) {
+          if (existsSync(p)) await rm(p);
+        }
+
+        if (phaseOk) break;
         this.logger.warn(
-          { workItemId: issue.id, attempt, verdict },
-          "build attempt failed, retrying",
+          { workItemId: issue.id, phase: phase.index, attempt, verdict },
+          "phase attempt failed",
         );
       }
-    } finally {
-      if (devServer) {
-        try {
-          await devServer.stop();
-          this.store.recordEvent(issue.id, "dev_server_stopped", {
-            port: devServer.port,
-          });
-        } catch (err) {
-          this.logger.warn({ err }, "failed to stop dev server cleanly");
-        }
+
+      if (aborted) break;
+
+      const outcome: PhaseOutcome = {
+        index: phase.index,
+        title: phase.title,
+        status: phaseOk ? "complete" : "failed",
+        attempts: attempt,
+        satisfiesAc: phase.satisfiesAc,
+        browserCheck: reportBrowser,
+        notes: reportNotes.replace(/\s+/g, " ").trim().slice(0, 500),
+      };
+      outcomes.push(outcome);
+
+      const sessionMarker = `phase-${phase.index} (${attempt} attempt${attempt === 1 ? "" : "s"}) @ ${new Date().toISOString()}`;
+      await appendMemorySection(memoryAbs, formatPhaseSection(outcome, sessionMarker));
+
+      this.store.recordEvent(
+        issue.id,
+        phaseOk ? "build_phase_complete" : "build_phase_failed",
+        { phase: phase.index, attempts: attempt },
+      );
+
+      // Commit this phase from the orchestrator side (don't trust the agent to
+      // commit). done.flag / phase-report.md are already removed so they don't
+      // leak into history; this picks up code changes + the memory.md section.
+      const commitMessage = phaseOk
+        ? `feat(${shortId}): phase ${phase.index} — ${truncate(phase.title, 60)}`
+        : `wip(${shortId}): phase ${phase.index} failed — ${truncate(phase.title, 60)}`;
+      try {
+        await this.git.commitAll(worktreePath, commitMessage);
+      } catch (err) {
+        this.logger.warn(
+          { err, workItemId: issue.id, phase: phase.index },
+          "phase commit failed; continuing",
+        );
+      }
+
+      if (!phaseOk) {
+        // Stop the loop — do not start later phases.
+        buildFailed = true;
+        break;
       }
     }
 
-    const aborted = lastResult?.aborted === true;
+    // Reviewer abort: leave per-phase commits local, don't push or comment.
+    // The orchestrator re-plans with the feedback folded in.
     if (aborted) {
-      // Don't post a build comment, don't push, don't mark build failed.
-      // The orchestrator will re-plan with reviewer feedback included.
       this.store.recordEvent(issue.id, "build_aborted_for_feedback", {
-        attempts: attempt,
+        phasesAttempted: outcomes.length,
       });
-      // Clean up the done.flag if it was left around (mid-write).
-      if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
+      for (const p of [doneFlagAbs, reportAbs]) {
+        if (existsSync(p)) await rm(p);
+      }
       return {
         ok: false,
-        attempts: attempt,
+        attempts: outcomes.reduce((n, o) => n + o.attempts, 0),
         headSha: null,
-        phases: [],
+        phases: outcomes,
         tickResult: null,
         aborted: true,
       };
     }
 
-    const finalProgress = (await safeRead(progressAbs)) ?? "";
-    const planMarkdown = (await safeRead(
-      join(this.config.summario.repoPath, planRelPath),
-    )) ?? (await safeRead(join(worktreePath, planRelPath))) ?? "";
-    const phases = parseProgress(finalProgress);
+    const ok =
+      !buildFailed &&
+      outcomes.length === planPhases.length &&
+      outcomes.every((o) => o.status === "complete");
 
-    // Commit any leftover agent files (progress.md, failures.md, summary.md).
-    // done.flag is removed before commit so it doesn't leak into history.
-    if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
-    const committedAgentFiles = await this.git.commitAll(
+    // Orchestrator writes the human-facing summary (the agent no longer does).
+    await writeFile(
+      summaryAbs,
+      buildSummaryMarkdown({ shortId, branch, ok, outcomes, totalPhases: planPhases.length }),
+    );
+
+    for (const p of [doneFlagAbs, reportAbs]) {
+      if (existsSync(p)) await rm(p);
+    }
+    await this.git.commitAll(
       worktreePath,
-      `chore(build): record progress for PLANE-${issue.sequenceId}`,
+      `chore(build): finalize memory + summary for ${shortId}`,
     );
 
     const headSha = await this.git.headSha(worktreePath);
@@ -301,7 +392,7 @@ export class Builder {
     // Sync Plane description: inject plan inside fence and tick satisfied ACs.
     let tickResult: TickResult | null = null;
     try {
-      tickResult = await this.syncPlaneDescription(issue.id, planMarkdown, phases);
+      tickResult = await this.syncPlaneDescription(issue.id, planMarkdown, outcomes);
     } catch (err) {
       this.logger.warn(
         { err, workItemId: issue.id },
@@ -312,19 +403,15 @@ export class Builder {
       });
     }
 
-    // Push whatever we have. Even partial success is worth pushing for review.
+    // Push whatever we have. Even a partial build is worth pushing for review.
     let pushedSha: string | null = null;
     try {
-      await this.git.push(
-        worktreePath,
-        this.config.summario.remoteName,
-        branch,
-      );
+      await this.git.push(worktreePath, this.config.summario.remoteName, branch);
       pushedSha = headSha;
       this.store.recordEvent(issue.id, "build_branch_pushed", {
         branch,
         headSha,
-        committedAgentFiles,
+        phases: outcomes.length,
       });
     } catch (err) {
       this.logger.error({ err, branch }, "git push failed");
@@ -339,8 +426,7 @@ export class Builder {
         issue.id,
         buildResultCommentHtml({
           ok,
-          attempts: attempt,
-          phases,
+          phases: outcomes,
           branch,
           headSha: pushedSha,
           tickResult,
@@ -360,26 +446,26 @@ export class Builder {
         headSha: pushedSha,
       });
     } else {
-      const transcript = lastResult?.transcript ?? "";
-      const reason = !lastResult?.doneFlagSeen
-        ? "no done.flag (timeout or crash)"
-        : "agent reported build-failed";
+      const failedPhase = outcomes.find((o) => o.status === "failed");
+      const reason = failedPhase
+        ? `phase ${failedPhase.index} (${failedPhase.title}) failed after ${failedPhase.attempts} attempt(s)`
+        : "build did not complete every phase";
       this.store.markBuildFailed(
         issue.id,
-        `building agent did not complete cleanly after ${attempt} attempt(s): ${reason}`,
+        `building agent did not complete cleanly: ${reason}`,
       );
       this.store.recordEvent(issue.id, "building_failed", {
-        attempts: attempt,
         reason,
-        transcriptTail: transcript.slice(-2_000),
+        phasesCompleted: outcomes.filter((o) => o.status === "complete").length,
+        phasesTotal: planPhases.length,
       });
     }
 
     return {
       ok,
-      attempts: attempt,
+      attempts: outcomes.reduce((n, o) => n + o.attempts, 0),
       headSha: pushedSha,
-      phases,
+      phases: outcomes,
       tickResult,
       aborted: false,
     };
@@ -390,8 +476,7 @@ export class Builder {
    * Vercel build log and fixes the offending code, then commits. The
    * orchestrator pushes the resulting branch so Vercel re-deploys.
    *
-   * Unlike `build()`, this doesn't start a dev server (irrelevant for
-   * build-failures) and doesn't retry within a single session (the
+   * Unlike `build()`, this doesn't retry within a single session (the
    * orchestrator-level loop with MAX_PREVIEW_FIXUP_ATTEMPTS does that).
    */
   async fixup(input: FixupInput): Promise<FixupResult> {
@@ -401,8 +486,7 @@ export class Builder {
     const issueDir = join(worktreePath, ".agent", "issues", issue.id);
     await mkdir(issueDir, { recursive: true });
 
-    const progressAbs = join(issueDir, "progress.md");
-    const failuresAbs = join(issueDir, "failures.md");
+    const memoryAbs = join(issueDir, "memory.md");
     const doneFlagAbs = join(issueDir, "done.flag");
 
     // Re-link node_modules / .env if the worktree lost them between runs.
@@ -411,6 +495,7 @@ export class Builder {
       worktreePath,
     });
 
+    await ensureMemoryFile(memoryAbs, shortId);
     if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
 
     const preSha = await this.git.headSha(worktreePath);
@@ -423,8 +508,7 @@ export class Builder {
       descriptionText: issue.descriptionText,
       branch,
       planRelPath,
-      progressRelPath: relative(worktreePath, progressAbs),
-      failuresRelPath: relative(worktreePath, failuresAbs),
+      memoryRelPath: relative(worktreePath, memoryAbs),
       doneFlagRelPath: relative(worktreePath, doneFlagAbs),
       attemptNumber,
       previewUrl,
@@ -475,9 +559,8 @@ export class Builder {
     const verdict = (flagContent ?? "").trim().split(/\s+/)[0] ?? "";
     if (existsSync(doneFlagAbs)) await rm(doneFlagAbs);
 
-    // Commit any leftover agent files (failures.md was almost certainly
-    // appended; progress.md may have been touched too). The agent's own
-    // code commit is already in place.
+    // Commit any leftover agent files (the agent appended a fixup section to
+    // memory.md; its code commit may or may not be in place).
     await this.git.commitAll(
       worktreePath,
       `chore(fixup): record fixup attempt ${attemptNumber} for ${shortId}`,
@@ -589,24 +672,15 @@ async function linkRepoArtifacts(
 const PHASE_HEADING_RE = /^##\s+Phase\s+(\d+)\s*[—:\-]\s*(.+?)\s*$/gim;
 
 /**
- * Parse the agent's progress.md into structured phase outcomes.
- *
- * The agent is asked to write blocks of the form:
- *
- *   ## Phase N — title
- *   - Status: complete | failed
- *   - Attempts: 2
- *   - Satisfies AC: 1, 3
- *   - Browser check: passed | skipped | failed
- *   - Notes: ...
- *
- * We're lenient: unknown lines are skipped, missing fields default to safe
- * "unknown" / empty values, and the parser walks heading-by-heading so a
- * malformed block doesn't break the rest.
+ * Parse the uniform `## Phase N` sections the orchestrator writes to memory.md
+ * back into structured outcomes. Tolerant: unknown lines skipped, missing
+ * fields default to safe values, malformed blocks don't break the rest. (h3
+ * `### Phase N attempt M` failure sub-notes and `## E2E` / `## Fixup` sections
+ * are ignored by the heading match.)
  */
-export function parseProgress(progressMd: string): PhaseOutcome[] {
+export function parsePhaseOutcomes(memoryMd: string): PhaseOutcome[] {
   const headings: Array<{ index: number; title: string; start: number; end: number }> = [];
-  const matches = [...progressMd.matchAll(PHASE_HEADING_RE)];
+  const matches = [...memoryMd.matchAll(PHASE_HEADING_RE)];
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i]!;
     const next = matches[i + 1];
@@ -614,13 +688,13 @@ export function parseProgress(progressMd: string): PhaseOutcome[] {
       index: Number(m[1]!),
       title: m[2]!.trim(),
       start: (m.index ?? 0) + m[0].length,
-      end: next?.index ?? progressMd.length,
+      end: next?.index ?? memoryMd.length,
     });
   }
 
   const outcomes: PhaseOutcome[] = [];
   for (const h of headings) {
-    const body = progressMd.slice(h.start, h.end);
+    const body = memoryMd.slice(h.start, h.end);
     const status = matchField(body, "Status");
     const attemptsStr = matchField(body, "Attempts");
     const satisfies = matchField(body, "Satisfies AC");
@@ -653,16 +727,6 @@ function escapeRe(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function parseAcList(raw: string | null): number[] {
-  if (!raw) return [];
-  const trimmed = raw.trim().toLowerCase();
-  if (trimmed === "" || trimmed === "none" || trimmed === "n/a") return [];
-  return trimmed
-    .split(/[,\s]+/)
-    .map((part) => Number.parseInt(part, 10))
-    .filter((n) => Number.isFinite(n) && n > 0);
-}
-
 function parseBrowserCheck(raw: string | null): PhaseOutcome["browserCheck"] {
   if (!raw) return "unknown";
   const t = raw.trim().toLowerCase();
@@ -670,6 +734,11 @@ function parseBrowserCheck(raw: string | null): PhaseOutcome["browserCheck"] {
   if (t.startsWith("fail")) return "failed";
   if (t.startsWith("skip")) return "skipped";
   return "unknown";
+}
+
+function truncate(input: string, max: number): string {
+  if (input.length <= max) return input;
+  return `${input.slice(0, max - 1)}…`;
 }
 
 function escapeHtml(input: string): string {
@@ -681,9 +750,42 @@ function escapeHtml(input: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function buildSummaryMarkdown(input: {
+  shortId: string;
+  branch: string;
+  ok: boolean;
+  outcomes: PhaseOutcome[];
+  totalPhases: number;
+}): string {
+  const lines: string[] = [];
+  lines.push(`# ${input.shortId} — build summary`);
+  lines.push("");
+  lines.push(
+    input.ok
+      ? `All ${input.totalPhases} phase(s) built successfully on \`${input.branch}\`.`
+      : `Build stopped early: ${input.outcomes.filter((o) => o.status === "complete").length}/${input.totalPhases} phase(s) completed on \`${input.branch}\`.`,
+  );
+  lines.push("");
+  lines.push("## Phases");
+  lines.push("");
+  for (const o of input.outcomes) {
+    const ac = o.satisfiesAc.length > 0 ? ` (AC ${o.satisfiesAc.join(", ")})` : "";
+    lines.push(`- Phase ${o.index} — ${o.title}: **${o.status}**${ac}`);
+    if (o.notes.trim().length > 0) lines.push(`  - ${o.notes.trim()}`);
+  }
+  if (input.outcomes.length < input.totalPhases) {
+    lines.push(
+      `- Phases ${input.outcomes.length + 1}–${input.totalPhases}: **not started** (earlier phase failed).`,
+    );
+  }
+  lines.push("");
+  lines.push("Each phase was implemented by its own Claude session; see memory.md for the full per-session log.");
+  lines.push("");
+  return lines.join("\n");
+}
+
 function buildResultCommentHtml(input: {
   ok: boolean;
-  attempts: number;
   phases: PhaseOutcome[];
   branch: string;
   headSha: string | null;
@@ -694,10 +796,10 @@ function buildResultCommentHtml(input: {
     : "<strong>Build did not complete.</strong>";
 
   const phaseList = input.phases.length === 0
-    ? "<p><em>No phase entries recorded in progress.md.</em></p>"
+    ? "<p><em>No phases were built.</em></p>"
     : `<ol>${input.phases
         .map((p) =>
-          `<li>Phase ${p.index} — ${escapeHtml(p.title)} — <code>${p.status}</code>${
+          `<li>Phase ${p.index} — ${escapeHtml(p.title)} — <code>${p.status}</code> (${p.attempts} session${p.attempts === 1 ? "" : "s"})${
             p.satisfiesAc.length > 0
               ? ` (AC ${p.satisfiesAc.join(", ")})`
               : ""
@@ -721,7 +823,7 @@ function buildResultCommentHtml(input: {
       }</p>`
     : "";
 
-  return `<p>${verdict} Attempts: ${input.attempts}.</p>
+  return `<p>${verdict} One Claude session per phase.</p>
 <p>Branch: <code>${escapeHtml(input.branch)}</code>${sha}</p>
 ${phaseList}
 ${tickLine}`;

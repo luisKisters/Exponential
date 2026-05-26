@@ -7,8 +7,8 @@ export interface BuildFixupPromptInput {
   branch: string;
   /** Repo-relative paths. */
   planRelPath: string;
-  progressRelPath: string;
-  failuresRelPath: string;
+  /** Single per-issue narrative log (Phase 5 slice 5c). */
+  memoryRelPath: string;
   doneFlagRelPath: string;
   /** 1-indexed fixup attempt number. */
   attemptNumber: number;
@@ -28,8 +28,7 @@ export function buildFixupPrompt(input: BuildFixupPromptInput): string {
     descriptionText,
     branch,
     planRelPath,
-    progressRelPath,
-    failuresRelPath,
+    memoryRelPath,
     doneFlagRelPath,
     attemptNumber,
     previewUrl,
@@ -68,7 +67,7 @@ ${buildLog || "(no log captured — investigate plan.md + recent commits instead
 
 # Workflow
 
-1. Read \`${planRelPath}\` and \`${progressRelPath}\` to understand what the Building Agent did. Skim \`git log --oneline -10\` to see the per-phase commits on this branch.
+1. Read \`${planRelPath}\` and \`${memoryRelPath}\` to understand what the Building Agent did. Skim \`git log --oneline -10\` to see the per-phase commits on this branch.
 2. Read the build log above. Identify the **specific root cause**: a missing import, a type mismatch, a Next.js / Convex / Tailwind misuse, a stale lockfile, etc. Don't guess — find the actual error.
 3. Fix it in the source. Stay minimal — touch only what is required to make the build green. Do not refactor, do not add scope.
 4. Run \`pnpm build\` locally in this worktree to confirm green. If it still fails, iterate up to 3 internal tries within this session before giving up.
@@ -82,7 +81,7 @@ ${buildLog || "(no log captured — investigate plan.md + recent commits instead
 
 When you finish (success OR failure):
 
-1. Append a section to \`${failuresRelPath}\` like:
+1. Append a section to \`${memoryRelPath}\` like:
 
 \`\`\`markdown
 ## Fixup attempt ${attemptNumber}

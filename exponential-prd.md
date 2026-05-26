@@ -125,10 +125,16 @@ AGENTS.md, CLAUDE.md, docs/architecture.md, docs/conventions.md, docs/runbook.md
 ```
 .agent/issues/PLANE-{id}/
   plan.md       — planning agent's phased plan
-  progress.md   — running log (append-only)
-  failures.md   — detailed failure notes
-  summary.md    — final summary after completion
+  memory.md     — append-only narrative log across every session (planning, each phase build, e2e, fixups)
+  summary.md    — final human-facing summary after completion
+  done.flag     — transient per-session completion signal (never committed)
 ```
+
+`memory.md` (Phase 5 slice 5c) replaced the old `progress.md` + `failures.md`
+pair: one file, one append-only narrative. The per-phase build sections are
+written by the orchestrator (parsed from each phase session's report) so their
+format is uniform; every other session (planning, e2e, fixup) appends its own
+section.
 
 ---
 
@@ -143,7 +149,7 @@ GitHub merge queue, no merge agent. Branch protection on summario's `main`:
 
 ## Phases
 
-Each phase is independently executable by an agent. Between phases, context can be cleared — PROGRESS.md carries forward what was done and what's next.
+Each phase is independently executable by an agent. Between phases, context can be cleared — `memory.md` carries forward what was done and what's next.
 
 ### Phase 1: Orchestrator Core
 
@@ -240,9 +246,9 @@ Wire the E2E agent and connect the full pipeline with failure loops.
 - E2E agent system prompt template: instructs Claude Code to read the original issue + memory, then independently test the Vercel preview
 - Vercel preview URL detection: poll Vercel API or GitHub deployment statuses until the preview is ready (with timeout)
 - `x-vercel-protection-bypass` header: pass to the E2E agent prompt so it configures agent-browser with the header
-- Pass/fail logic: E2E agent writes verdict to `.agent/issues/PLANE-{id}/progress.md`; orchestrator reads it
+- Pass/fail logic: E2E agent writes its verdict to `.agent/issues/PLANE-{id}/verdict.txt` (+ `done.flag`) and observations to `memory.md`; orchestrator reads the verdict
 - Full pipeline wiring: orchestrator runs planning → building → E2E in sequence
-- Failure loop: if E2E fails, re-run planning agent with failure context from `failures.md`, then building agent with revised plan. Max 3 full loops.
+- Failure loop: if E2E fails, re-run planning agent with failure context from `memory.md`, then building agent with revised plan. Max 3 full loops.
 - Terminal states:
   - Success: move Plane issue to "Human Review", post summary comment
   - Failure after 3 loops: move to "Failed", post comment with failure history
@@ -340,14 +346,14 @@ The original slice 5a treated a failed Vercel preview as a retriable resource an
 - On Vercel preview failure (`state !== "success"`), the orchestrator:
   1. Calls `npx vercel inspect --logs <preview-url>` and captures the tail (~50 KB) as the build log.
   2. Posts **one** Plane comment per fixup attempt (not per poll): `"Vercel preview build failed on <sha> (state: failure). Spawning fixup agent — attempt N/MAX."`.
-  3. Spawns a fresh Claude session in the worktree with a dedicated `buildFixup` prompt (`src/prompts/buildFixup.ts`). The prompt embeds the build log, points the agent at `plan.md` + `progress.md` + recent commits, and instructs it to diagnose the root cause, fix the code, run `pnpm build` locally to confirm green, commit (`fix(PLANE-N): vercel build attempt M — <cause>`), and exit. No push, no Plane calls, no scope expansion.
-  4. After the session ends with verdict `fixup-ok`, the orchestrator commits any leftover `failures.md` notes, checks that HEAD actually advanced, and pushes the branch. Vercel auto-redeploys on the new SHA; the loop re-enters `waitForPreview` with the new SHA.
+  3. Spawns a fresh Claude session in the worktree with a dedicated `buildFixup` prompt (`src/prompts/buildFixup.ts`). The prompt embeds the build log, points the agent at `plan.md` + `memory.md` + recent commits, and instructs it to diagnose the root cause, fix the code, run `pnpm build` locally to confirm green, commit (`fix(PLANE-N): vercel build attempt M — <cause>`), and exit. No push, no Plane calls, no scope expansion. (Originally `progress.md`/`failures.md`; now `memory.md` after slice 5c.)
+  4. After the session ends with verdict `fixup-ok`, the orchestrator commits any leftover `memory.md` notes, checks that HEAD actually advanced, and pushes the branch. Vercel auto-redeploys on the new SHA; the loop re-enters `waitForPreview` with the new SHA.
 - Terminal failures:
   - Cap exhausted: `last_error = "vercel preview failed after N fixup attempt(s)"`.
   - Fixup verdict is `fixup-failed` or HEAD didn't advance: terminate immediately, since a fresh poll would just see the same failure on the same SHA.
   - No preview URL available (Vercel never registered a deployment): terminate — we have no log to give the agent, so there's no productive fixup to attempt.
 - Reviewer-feedback abort (Phase 4.5) is honored throughout: the fixup session is spawned with an `AbortSignal` and a reviewer comment kills the in-flight session, drops back to the `plan` stage with the feedback folded in.
-- The Vercel-CLI switch (full deploy via CLI, not just log retrieval), `memory.md` consolidation, and per-phase-commit workflow are still deferred — captured as slices 5b/5c/5d for later turns.
+- The Vercel-CLI switch (full deploy via CLI, not just log retrieval) is still deferred — captured as slice 5b for a later turn. **Slice 5c (`memory.md` consolidation) and the per-phase-commit workflow shipped with Phase 6 below** (the multi-session builder needed both).
 
 ---
 
@@ -371,10 +377,21 @@ Today one Claude session implements every phase of `plan.md` — long, expensive
 - Each per-phase session is told: "Do not run dev server, do not push, do not call Plane — the orchestrator handles all of that. You implement, you run `pnpm build`, you write to `memory.md`, you exit."
 
 **Acceptance test:**
-- Pick up a 3-phase issue. Verify the orchestrator spawns exactly 3 Claude sessions (one per phase), each visible as separate `claude_session_started` / `claude_session_finished` event pairs in SQLite.
+- Pick up a 3-phase issue. Verify the orchestrator spawns exactly 3 Claude sessions (one per phase), each visible as separate `build_phase_session_started` / `build_phase_session_finished` event pairs in SQLite.
 - `memory.md` on the branch has 3 phase-build sections, each authored by a distinct session, with prior sections visible to each later session at start time.
 - Total Claude wall-clock time for the build stage is ≤ today's single-session time (best-case much less; worst-case equal if phases happen to need everything).
 - A deliberately-failing Phase 2 surfaces as: Phase 1 session completes + commits + writes memory, Phase 2 session fails after retries + writes memory, Phase 3 session is *not* started (build stage terminates).
+
+**Shipped:**
+
+The build stage is now a per-phase loop in `Builder.build()`. For each `## Phase N` block (parsed by the new shared `src/plan.ts` `parsePlanPhases`, which extracts index + title + body + `Satisfies AC`):
+
+1. A fresh Claude session (`src/prompts/buildPhase.ts`) gets the full plan, the running `memory.md`, and "implement Phase N and ONLY Phase N — no dev server, no commit, no push, no Plane calls; run `pnpm build`, write a report + `done.flag`, exit." Per-session cap is `PHASE_TIMEOUT_MS` (default 15 min).
+2. The orchestrator runs the **authoritative** `pnpm build` itself (`src/pnpm.ts`) when the agent claims `phase-ok` — the agent's verdict alone isn't trusted.
+3. The orchestrator (not the agent) writes the uniform `## Phase N` section to `memory.md` (`src/memory.ts` `formatPhaseSection`, parseable back by `parsePhaseOutcomes`) with a distinct per-session marker, then commits the phase as `feat(PLANE-N): phase M — <title>`.
+4. A failed phase is retried in a fresh session up to `PHASE_MAX_ATTEMPTS` (default 2). If it still fails, the loop stops — later phases are not started — and the stage returns `ok:false`.
+
+Events: `build_phase_session_started` / `build_phase_session_finished` (one pair per session, carrying `phase` + `attempt` + `verdict`), plus `build_phase_build_started/finished`, `build_phase_complete` / `build_phase_failed`. The Phase 4.5 reviewer-feedback abort is threaded through every per-phase session: an abort stops the loop and surfaces `aborted:true` so the pipeline re-plans. The dev server is gone from the build stage (per-phase browser checks are deferred to the E2E agent against the Vercel preview). Slice 5c (`memory.md`) folded in: `progress.md` + `failures.md` are replaced everywhere by the single append-only `memory.md`.
 
 ---
 
@@ -492,7 +509,7 @@ Vercel-retry transitions, `MAX_PREVIEW_RETRIES` cap, `memory.md` presence/absenc
 
 ### Phase 6 — Multi-session builder
 
-Per-session `claude_session_started`/`claude_session_finished` event counts in SQLite, `memory.md` section authorship, per-phase commit timestamps, total wall-clock vs single-session baseline — all terminal.
+Per-phase `build_phase_session_started`/`build_phase_session_finished` event counts in SQLite, `memory.md` section authorship (distinct per-session markers), per-phase commit timestamps, total wall-clock vs single-session baseline — all terminal.
 
 **Not terminal-testable:**
 - **Whether fresh sessions actually produce better-quality work** (the whole point of the split). Token cost is measurable from logs; quality requires reading the resulting diffs.

@@ -1,14 +1,17 @@
 /* eslint-disable no-console */
 /**
- * Quick smoke test for the pure helpers used by Phase 3:
- *   - planeDescription.injectPlanFence
- *   - planeDescription.tickAcceptanceCriteria
- *   - builder.parseProgress
+ * Quick smoke test for the pure helpers used by the pipeline:
+ *   - planeDescription.injectPlanFence / tickAcceptanceCriteria
+ *   - builder.parsePhaseOutcomes (memory.md phase sections)
+ *   - plan.parsePlanPhases / extractPhaseTitles / parseAcList (Phase 6)
+ *   - memory.formatPhaseSection (Phase 6)
  *
  * Run with: pnpm tsx scripts/smoke-helpers.ts
  */
-import { parseProgress } from "../src/builder.ts";
+import { parsePhaseOutcomes, type PhaseOutcome } from "../src/builder.ts";
 import { parseVerdict } from "../src/e2e.ts";
+import { formatPhaseSection } from "../src/memory.ts";
+import { extractPhaseTitles, parseAcList, parsePlanPhases } from "../src/plan.ts";
 import {
   injectPlanFence,
   planMarkdownToHtml,
@@ -129,7 +132,7 @@ console.log("\n== tickAcceptanceCriteria (out-of-range / empty / no AC) ==");
   check("matches in-range, skips out-of-range", result.matched.join(",") === "1" && result.skipped.join(",") === "5");
 }
 
-console.log("\n== parseProgress ==");
+console.log("\n== parsePhaseOutcomes (memory.md phase sections) ==");
 {
   const sample = `# Build progress
 
@@ -157,7 +160,7 @@ console.log("\n== parseProgress ==");
 - Browser check: failed
 - Notes: dev server returned 500 on /preview
 `;
-  const phases = parseProgress(sample);
+  const phases = parsePhaseOutcomes(sample);
   check("3 phases parsed", phases.length === 3);
   check("phase 1 complete + AC=[1,2]",
     phases[0]!.status === "complete" && phases[0]!.satisfiesAc.join(",") === "1,2",
@@ -208,6 +211,104 @@ console.log("\n== looksLikeInfraFailure ==");
   check("bad token → infra", looksLikeInfraFailure(tokenLog).infra === true);
 
   check("empty log → not infra", looksLikeInfraFailure("").infra === false);
+}
+
+console.log("\n== parseAcList ==");
+{
+  check("comma list", parseAcList("1, 2, 3").join(",") === "1,2,3");
+  check("space list", parseAcList("1 2").join(",") === "1,2");
+  check("none → []", parseAcList("none").length === 0);
+  check("n/a → []", parseAcList("n/a").length === 0);
+  check("null → []", parseAcList(null).length === 0);
+  check("filters non-positive / junk", parseAcList("0, -1, 2, foo").join(",") === "2");
+}
+
+console.log("\n== parsePlanPhases (per-phase extraction + Satisfies AC) ==");
+{
+  const plan = `# PLANE-7 — Add teal button
+
+## Overview
+
+Some overview prose.
+
+## Phase 1 — Add the button component
+
+**Goal:** add a button.
+
+**Likely changes:**
+- components/Button.tsx
+
+**Satisfies AC:** 1, 2   <!-- or \`none\` -->
+
+**Browser acceptance check:**
+A teal button appears.
+
+## Phase 2 — Wire the handler
+
+**Goal:** click does a thing.
+
+**Satisfies AC**: none
+
+**Browser acceptance check:**
+Clicking shows a toast.
+
+## Phase 3 — Telemetry
+
+Satisfies AC: 3
+
+Some trailing prose.
+`;
+  const phases = parsePlanPhases(plan);
+  check("3 phases parsed", phases.length === 3);
+  check("phase 1 index + title",
+    phases[0]!.index === 1 && phases[0]!.title === "Add the button component");
+  check("phase 1 Satisfies AC = [1,2] (bold, trailing comment stripped)",
+    phases[0]!.satisfiesAc.join(",") === "1,2");
+  check("phase 1 raw drops the html comment",
+    !(phases[0]!.satisfiesAcRaw ?? "").includes("<!--"));
+  check("phase 1 body carries the goal", phases[0]!.body.includes("add a button"));
+  check("phase 2 Satisfies AC = [] (none, bold-before-colon)",
+    phases[1]!.satisfiesAc.length === 0 && (phases[1]!.satisfiesAcRaw ?? "").toLowerCase() === "none");
+  check("phase 3 Satisfies AC = [3] (plain, no bold)",
+    phases[2]!.satisfiesAc.join(",") === "3");
+  check("phase 3 body excludes phase 2 content",
+    !phases[2]!.body.includes("Clicking shows a toast"));
+  check("extractPhaseTitles agrees with parsePlanPhases",
+    extractPhaseTitles(plan).join("|") === "Add the button component|Wire the handler|Telemetry");
+  check("plan with no phases → []",
+    parsePlanPhases("# Just a title\n\nNo phases here.").length === 0);
+}
+
+console.log("\n== formatPhaseSection (round-trips through parsePhaseOutcomes) ==");
+{
+  const outcome: PhaseOutcome = {
+    index: 2,
+    title: "Wire up the hook",
+    status: "complete",
+    attempts: 3,
+    satisfiesAc: [1, 4],
+    browserCheck: "skipped",
+    notes: "Added useThing hook;\n  reviewer should confirm the toast.",
+  };
+  const section = formatPhaseSection(outcome, "phase-2 @ 2026-05-27T00:00:00.000Z");
+  check("section has the Phase 2 heading", section.includes("## Phase 2 — Wire up the hook"));
+  check("section carries a distinct Session marker", section.includes("- Session: phase-2 @"));
+  check("multi-line notes collapsed to one line",
+    section.includes("- Notes: Added useThing hook; reviewer should confirm the toast."));
+
+  const parsed = parsePhaseOutcomes(section);
+  check("round-trips to exactly one phase", parsed.length === 1);
+  check("round-trip index/status", parsed[0]!.index === 2 && parsed[0]!.status === "complete");
+  check("round-trip attempts", parsed[0]!.attempts === 3);
+  check("round-trip Satisfies AC", parsed[0]!.satisfiesAc.join(",") === "1,4");
+  check("round-trip browser check", parsed[0]!.browserCheck === "skipped");
+
+  const none = formatPhaseSection(
+    { index: 1, title: "Refactor", status: "failed", attempts: 2, satisfiesAc: [], browserCheck: "skipped", notes: "" },
+    "phase-1 @ x",
+  );
+  check("empty AC renders as 'none'", none.includes("- Satisfies AC: none"));
+  check("empty notes renders as '(none)'", none.includes("- Notes: (none)"));
 }
 
 console.log("");

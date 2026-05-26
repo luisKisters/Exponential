@@ -26,8 +26,14 @@ export interface Config {
     devServer: "auto" | "off" | "required";
     /** First port to probe for the dev server. */
     devServerBasePort: number;
-    /** Hard cap on orchestrator-level retries when the agent reports build-failed. */
+    /** Legacy single-session retry cap (Phase 3). Phase 6 builds per-phase; see phaseMaxAttempts. */
     maxAttempts: number;
+    /** Phase 6: max attempts (fresh sessions) per plan phase before the build stage gives up. */
+    phaseMaxAttempts: number;
+    /** Phase 6: hard wall-clock cap on each per-phase Claude session. */
+    phaseTimeoutMs: number;
+    /** Phase 6: hard cap on the orchestrator-side `pnpm build` gate per phase. */
+    buildTimeoutMs: number;
   };
   vercel: {
     /** Value of x-vercel-protection-bypass header (passed to E2E agent). */
@@ -119,6 +125,9 @@ export function loadConfig(): Config {
       devServer: parseDevServerMode(optional("BUILDER_DEV_SERVER", "auto")),
       devServerBasePort: int("BUILDER_DEV_SERVER_PORT", 3001),
       maxAttempts: int("BUILDER_MAX_ATTEMPTS", 3),
+      phaseMaxAttempts: int("PHASE_MAX_ATTEMPTS", 2),
+      phaseTimeoutMs: int("PHASE_TIMEOUT_MS", 15 * 60_000),
+      buildTimeoutMs: int("PNPM_BUILD_TIMEOUT_MS", 10 * 60_000),
     },
     vercel: {
       protectionBypass: optional("VERCEL_PROTECTION_BYPASS", "") || null,

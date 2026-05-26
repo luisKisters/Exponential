@@ -13,8 +13,8 @@ export interface PlanningPromptInput {
   planRelPath: string;
   /** Path (relative to repo root) where the agent writes the completion flag. */
   doneFlagRelPath: string;
-  /** Path (relative to repo root) for the progress log. */
-  progressRelPath: string;
+  /** Path (relative to repo root) for the per-issue memory log. */
+  memoryRelPath: string;
   /** Branch name the worktree is checked out on. */
   branch: string;
   /** 1-indexed pipeline loop number. 1 = first plan, 2+ = revision after E2E failure. */
@@ -30,7 +30,7 @@ export function buildPlanningPrompt(input: PlanningPromptInput): string {
     descriptionText,
     planRelPath,
     doneFlagRelPath,
-    progressRelPath,
+    memoryRelPath,
     branch,
     loopNumber = 1,
     priorFailures = "",
@@ -109,7 +109,7 @@ What a person opening the preview should be able to do/see to know this phase is
 
 # Per-issue memory
 
-You may also append helpful context to \`${progressRelPath}\` (e.g. things the Building Agent should know but that don't belong in the plan itself). This file may not exist yet — create it if useful.
+You may also append helpful context to \`${memoryRelPath}\` (e.g. things the Building Agent should know but that don't belong in the plan itself). This is the issue's shared, append-only memory log across all sessions — add a short \`## Planning notes\` section if useful. The file may not exist yet — create it if so.
 
 # When you are done
 

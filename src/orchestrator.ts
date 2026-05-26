@@ -596,7 +596,7 @@ export class Orchestrator {
 
         if (e2eResult.verdict === "e2e-blocked") {
           await this.finishPipeline(issue, "failed", {
-            reason: "e2e blocked (couldn't verify — see failures.md)",
+            reason: "e2e blocked (couldn't verify — see memory.md)",
             previewUrl,
             planResult,
             loop,
@@ -605,8 +605,10 @@ export class Orchestrator {
         }
 
         // e2e-failed or no-verdict: accumulate context and loop back to plan.
-        const failuresContent = await readFailuresFile(planResult.worktreePath, issue.id);
-        priorFailures = `## Loop ${loop} E2E failure\n\nfailures.md after loop ${loop}:\n\n${(failuresContent ?? "(empty)").slice(0, 16_000)}`;
+        // memory.md is the full per-issue narrative; the tail holds the most
+        // recent e2e notes, which is what the next planning loop needs most.
+        const memoryContent = await readMemoryFile(planResult.worktreePath, issue.id);
+        priorFailures = `## Loop ${loop} E2E failure\n\nmemory.md tail after loop ${loop}:\n\n${(memoryContent ?? "(empty)").slice(-16_000)}`;
 
         loop++;
         if (loop > this.config.pipeline.maxLoops) {
@@ -1113,11 +1115,11 @@ function issueFromRow(row: IssueRow, stateId: string): PlaneIssue {
   };
 }
 
-async function readFailuresFile(
+async function readMemoryFile(
   worktreePath: string,
   workItemId: string,
 ): Promise<string | null> {
-  const path = join(worktreePath, ".agent", "issues", workItemId, "failures.md");
+  const path = join(worktreePath, ".agent", "issues", workItemId, "memory.md");
   try {
     return await readFile(path, "utf8");
   } catch {

@@ -5,6 +5,7 @@ import { ClaudeSession } from "./claude.js";
 import type { Config } from "./config.js";
 import { buildBranchName, buildWorktreePath, Git } from "./git.js";
 import type { Logger } from "./logger.js";
+import { extractPhaseTitles } from "./plan.js";
 import { injectPlanFence } from "./planeDescription.js";
 import type { PlaneApi, PlaneIssue } from "./plane.js";
 import { buildPlanningPrompt } from "./prompts/planning.js";
@@ -87,7 +88,7 @@ export class Planner {
     await mkdir(issueDir, { recursive: true });
 
     const planAbsPath = join(issueDir, "plan.md");
-    const progressAbsPath = join(issueDir, "progress.md");
+    const memoryAbsPath = join(issueDir, "memory.md");
     const doneFlagAbsPath = join(issueDir, "done.flag");
 
     // If a previous run left these around, clear them so we get a fresh
@@ -100,7 +101,7 @@ export class Planner {
 
     const shortId = `PLANE-${issue.sequenceId}`;
     const planRelPath = relative(worktreePath, planAbsPath);
-    const progressRelPath = relative(worktreePath, progressAbsPath);
+    const memoryRelPath = relative(worktreePath, memoryAbsPath);
     const doneFlagRelPath = relative(worktreePath, doneFlagAbsPath);
 
     const prompt = buildPlanningPrompt({
@@ -111,7 +112,7 @@ export class Planner {
       descriptionText: detail.descriptionText,
       planRelPath,
       doneFlagRelPath,
-      progressRelPath,
+      memoryRelPath,
       branch,
       loopNumber: opts.loopNumber ?? 1,
       priorFailures: opts.priorFailures ?? "",
@@ -277,20 +278,6 @@ export class PlanningAbortedError extends Error {
     super(message);
     this.name = "PlanningAbortedError";
   }
-}
-
-/**
- * Extract "## Phase N — title" headings (or "## Phase N: title") from the
- * generated plan.
- */
-export function extractPhaseTitles(markdown: string): string[] {
-  const titles: string[] = [];
-  const re = /^##\s+Phase\s+\d+\s*[—:\-]\s*(.+?)\s*$/gim;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(markdown)) !== null) {
-    titles.push(match[1]!.trim());
-  }
-  return titles;
 }
 
 function truncate(input: string, max: number): string {
