@@ -395,6 +395,44 @@ Events: `build_phase_session_started` / `build_phase_session_finished` (one pair
 
 ---
 
+### Phase 6.5: Live dashboard fence
+
+Today the Plane issue description (inside the `<!-- exponential:plan v1 ... -->` fence) carries the full plan rendered as HTML — useful for plan inspection, but noisy, and there is no in-issue indicator of where the pipeline currently is or which phases have shipped. Reviewers also routinely create issues with no `## Acceptance Criteria`, which leaves the AC-tick code path with nothing to tick and silently drops the build's verification surface. Replace the fence's contents with a compact live dashboard, and force every issue to carry ACs.
+
+**What to build:**
+
+- **AC enforcement (auto-draft, not hard-fail).** The Planning Agent always ensures the issue has an `## Acceptance Criteria` section:
+  - If the human wrote one, leave it byte-for-byte alone.
+  - If absent, the planner drafts 2–5 ACs from the description and injects them into the Plane description **above** the fence, wrapped in a sentinel like `<!-- exponential:ac-autodraft v1 start -->…<!-- exponential:ac-autodraft v1 end -->`. The orchestrator never re-stomps the contents on later loops — the human can edit freely, and the sentinel just records provenance.
+  - Fallback: if the description is too thin to draft meaningful ACs (e.g. one-liner with no testable behavior), planning fails fast with a Plane comment ("description is too vague to extract acceptance criteria — please add a `## Acceptance Criteria` section or expand the description") and leaves the SQLite row in `picked_up` without a plan.
+- **Dashboard fence (replaces the plan dump).** Inside the existing `<!-- exponential:plan v1 ... -->` sentinels, render a compact status header + per-phase checklist instead of the full plan HTML:
+  ```
+  **Status:** Building — phase 2/3 · branch `agent/PLANE-42-add-button` · updated 14:02 UTC
+
+  **Phases**
+  - [x] Phase 1 — Add the button component (AC 1)
+  - [ ] Phase 2 — Wire the handler (AC 2) ← active
+  - [ ] Phase 3 — Telemetry (AC 3)
+
+  Full plan: `.agent/issues/PLANE-42/plan.md` on branch `agent/PLANE-42-add-button`.
+  ```
+  Phase checkboxes flip on `build_phase_complete`. The full plan still lives at `plan.md` on the branch — the fence carries a link, not a dump.
+- **Status header rewrites on every stage transition.** The orchestrator rewrites the `Status:` line + active-phase marker at each of: `planning_started`, `planning_complete`, `building_started`, every `build_phase_session_started` / `build_phase_complete`, `preview_wait_started`, `e2e_started`, terminal (`pipeline_human_review` / `pipeline_failed`). One Plane `updateDescriptionHtml` per transition — a handful per pipeline run, well under any rate limit.
+- **Reuse the existing fence machinery.** `injectPlanFence` grows a dashboard mode (or splits into `injectDashboardFence`); the AC ticking code path (`tickAcceptanceCriteria`) is unchanged — it ticks the *human-facing* AC bullets above the fence, separate from the new per-phase TODO list inside the fence, which the orchestrator owns end-to-end.
+
+**Acceptance test:**
+
+- Create an issue with **no** `## Acceptance Criteria` section. Orchestrator picks it up; the description grows an auto-drafted AC section above the fence (with the sentinel comment); planning proceeds normally; phases tick the drafted ACs as they complete.
+- Create a second issue with a one-line description and no ACs. Orchestrator picks it up, posts the "description too vague" comment, leaves the issue alone (no fence, no plan).
+- During a normal pipeline run, the Plane description's fence shows a status line that transitions `Planning` → `Building — phase 1/N` → `Building — phase 2/N` → … → `E2E` → `Human Review`, and the phase checkboxes tick in real time as each `build_phase_complete` fires (visible via `curl <plane-issue> | grep Status`).
+- The full plan does **not** appear inside the description fence (it lives at the linked path on the branch); the human-facing AC list above the fence is untouched after the first auto-draft, even across multiple pipeline loops.
+
+**Not terminal-testable:**
+
+- **Auto-drafted AC quality.** Whether the planner's drafted ACs match what the human would have written. The sentinel + the "human can edit, orchestrator never re-stomps" rule give the reviewer a recovery path, but the initial draft requires reading.
+
+---
+
 ### Phase 7: Review pass
 
 Insert a code-review hop between Build and E2E so we catch correctness/maintainability bugs the human reviewer would otherwise have to find. Output is a structured findings file; a *separate* fresh Claude session addresses the findings before E2E runs.
@@ -513,6 +551,13 @@ Per-phase `build_phase_session_started`/`build_phase_session_finished` event cou
 
 **Not terminal-testable:**
 - **Whether fresh sessions actually produce better-quality work** (the whole point of the split). Token cost is measurable from logs; quality requires reading the resulting diffs.
+
+### Phase 6.5 — Live dashboard fence
+
+Fence content after each stage transition (one `curl` + a small HTML matcher per transition), AC section presence + sentinel after the first plan, per-phase checkbox state vs `build_phase_complete` events, "description too vague" path leaving the SQLite row in `picked_up` with no `plan_path` — all terminal.
+
+**Not terminal-testable:**
+- **Auto-drafted AC quality.** Whether the drafted ACs actually capture the human's intent. Same plan-quality gap as Phase 2.
 
 ### Phase 7 — Review pass
 
