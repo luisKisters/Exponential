@@ -125,9 +125,11 @@ AGENTS.md, CLAUDE.md, docs/architecture.md, docs/conventions.md, docs/runbook.md
 ```
 .agent/issues/PLANE-{id}/
   plan.md       — planning agent's phased plan
-  memory.md     — append-only narrative log across every session (planning, each phase build, e2e, fixups)
+  memory.md     — append-only narrative log across every session (planning, each phase build, review, e2e, fixups)
+  review.md     — Phase 7 code-review findings (rewritten each review pass)
   summary.md    — final human-facing summary after completion
   done.flag     — transient per-session completion signal (never committed)
+  ac-draft.md   — Phase 6.5 auto-drafted acceptance criteria (only when the human left none)
 ```
 
 `memory.md` (Phase 5 slice 5c) replaced the old `progress.md` + `failures.md`
@@ -404,7 +406,7 @@ Today the Plane issue description (inside the `<!-- exponential:plan v1 ... -->`
 - **AC enforcement (auto-draft, not hard-fail).** The Planning Agent always ensures the issue has an `## Acceptance Criteria` section:
   - If the human wrote one, leave it byte-for-byte alone.
   - If absent, the planner drafts 2–5 ACs from the description and injects them into the Plane description **above** the fence, wrapped in a sentinel like `<!-- exponential:ac-autodraft v1 start -->…<!-- exponential:ac-autodraft v1 end -->`. The orchestrator never re-stomps the contents on later loops — the human can edit freely, and the sentinel just records provenance.
-  - Fallback: if the description is too thin to draft meaningful ACs (e.g. one-liner with no testable behavior), planning fails fast with a Plane comment ("description is too vague to extract acceptance criteria — please add a `## Acceptance Criteria` section or expand the description") and leaves the SQLite row in `picked_up` without a plan.
+  - Fallback: if the description is too thin to draft meaningful ACs (e.g. one-liner with no testable behavior), planning fails fast with a Plane comment ("description is too vague to extract acceptance criteria — please add a `## Acceptance Criteria` section or expand the description") and **does not** write a plan. The Plane state is left untouched (the issue is "left alone" for the human to expand), but the SQLite row is set to `failed` rather than `picked_up` — leaving it `picked_up` would make `hasActiveIssue()` treat it as the in-flight issue and permanently block the single-issue queue until someone hand-edited the DB. `failed` unblocks the queue; re-triggering still requires the human to clear the row (same as any other terminal issue, per the `!row` pickup guard).
 - **Dashboard fence (replaces the plan dump).** Inside the existing `<!-- exponential:plan v1 ... -->` sentinels, render a compact status header + per-phase checklist instead of the full plan HTML:
   ```
   **Status:** Building — phase 2/3 · branch `agent/PLANE-42-add-button` · updated 14:02 UTC
@@ -430,6 +432,11 @@ Today the Plane issue description (inside the `<!-- exponential:plan v1 ... -->`
 **Not terminal-testable:**
 
 - **Auto-drafted AC quality.** Whether the planner's drafted ACs match what the human would have written. The sentinel + the "human can edit, orchestrator never re-stomps" rule give the reviewer a recovery path, but the initial draft requires reading.
+
+**Shipped:**
+
+- **AC enforcement.** `buildPlanningPrompt` now takes `hasAcceptanceCriteria` + `acDraftRelPath`. When the issue has no `## Acceptance Criteria`, the agent either writes 2–5 drafted criteria to `ac-draft.md` (the planner injects them above the fence via `injectAutodraftedAc`, wrapped in the `<!-- exponential:ac-autodraft v1 … -->` sentinel) or — if the body is too thin — writes the `too-vague` verdict to `done.flag`. `Planner.plan` reads `detail.descriptionText` to decide `hasAcceptanceCriteria` (so once an auto-draft exists, retry loops detect it and never re-draft), throws `PlanningTooVagueError` on the `too-vague` verdict, and the orchestrator handles it by stripping any fence it created, posting the "too vague" comment, and marking the SQLite row `failed` (see the fallback note above — diverges from the original `picked_up` wording to avoid bricking the queue). The auto-drafted ACs render as a TipTap task list so the existing `tickAcceptanceCriteria` can tick them.
+- **Dashboard fence.** New `src/dashboard.ts` renders the compact status header + per-phase ☑/☐/☒ checklist + plan link; `planeDescription.injectDashboardFence` (factored out of `injectPlanFence` via a shared `injectFence`) places it in the same sentinel fence. The **orchestrator owns the dashboard end-to-end**: a single `DashboardModel` for the in-flight issue, rewritten via `pushDashboard` on each transition — `Planning` (pre-plan), `Building — phase N/M` (driven by a new `onProgress` callback the builder fires per phase), `Review`, `E2E` (deploying/verifying), and the terminal `Human Review` / `Failed`. The planner and builder no longer dump the plan into the fence; the builder's `tickAcceptanceCriteria` path is unchanged and still ticks the human-facing AC bullets above the fence. The phase glyphs are plain text (not real checkboxes) on purpose, so the only tickable boxes are the AC list above the fence.
 
 ---
 
@@ -459,6 +466,14 @@ Insert a code-review hop between Build and E2E so we catch correctness/maintaina
   - Fixup session lands a new commit addressing the finding.
   - Review-recheck either says `review-clean` or surfaces *different* remaining findings (not the same ones — the fixup actually did something).
 - Run a build with no real issues. Confirm `review.md` says `review-clean` and the pipeline goes straight to E2E.
+
+**Shipped:**
+
+The pipeline order is now `plan → build → review → fixup-if-needed → review-recheck → e2e`, with a dedicated `"review"` stage inserted between `build` and `e2e` in `Orchestrator.pipelineLoop`.
+
+- New `src/reviewer.ts` (`Reviewer`) with `review()` and `fixup()`, plus prompts `src/prompts/review.ts` (reads the diff cold via `git diff origin/main...HEAD` against `plan.md` + the original issue, writes structured `### Finding N` entries to `review.md`, verdict `review-clean` | `review-findings`) and `src/prompts/reviewFixup.ts` (reads only `review.md`, addresses each finding, runs `pnpm build`, verdict `fixup-ok` | `fixup-failed`).
+- `Orchestrator.runReviewStage`: runs the initial review; on `review-findings` spawns a fixup session then re-runs the review **once**; if findings remain it logs `review_proceeding_with_findings` and proceeds to E2E anyway (no blocking on subjective feedback). Every session is wrapped in `registerStageAbort`, so a reviewer-feedback comment aborts the review/fixup and drops back to the `plan` stage like every other stage.
+- The stage is a **best-effort quality gate** — a thrown session is logged and treated as no-verdict, never failing the pipeline. `review.md` is committed + pushed each pass (so the human sees it on the branch); the fixup commit advances HEAD, and the orchestrator threads the post-fixup sha forward (`headShaForPreview`) so E2E's Vercel preview targets the reviewed/fixed commit. New config `review.timeoutMs` (`REVIEW_TIMEOUT_MS`, default 15 min); the fixup session reuses `CLAUDE_TIMEOUT_MS` since it builds. Events: `review_session_started/finished`, `review_pushed`, `review_clean`, `review_findings`, `review_fixup_started/finished/pushed`, `review_clean_after_fixup`, `review_proceeding_with_findings`.
 
 ---
 
@@ -554,7 +569,7 @@ Per-phase `build_phase_session_started`/`build_phase_session_finished` event cou
 
 ### Phase 6.5 — Live dashboard fence
 
-Fence content after each stage transition (one `curl` + a small HTML matcher per transition), AC section presence + sentinel after the first plan, per-phase checkbox state vs `build_phase_complete` events, "description too vague" path leaving the SQLite row in `picked_up` with no `plan_path` — all terminal.
+Fence content after each stage transition (one `curl` + a small HTML matcher per transition), AC section presence + sentinel after the first plan, per-phase checkbox state vs `build_phase_complete` events, "description too vague" path leaving the SQLite row in `failed` with no `plan_path` and the Plane state untouched (no fence) — all terminal.
 
 **Not terminal-testable:**
 - **Auto-drafted AC quality.** Whether the drafted ACs actually capture the human's intent. Same plan-quality gap as Phase 2.

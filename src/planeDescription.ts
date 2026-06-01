@@ -20,6 +20,13 @@
 const FENCE_START = "<!-- exponential:plan v1 start -->";
 const FENCE_END = "<!-- exponential:plan v1 end -->";
 
+// Phase 6.5: provenance markers for an auto-drafted Acceptance Criteria section.
+// The orchestrator injects this block (above the fence) only when the human
+// left no `## Acceptance Criteria` of their own, and never re-stomps it on
+// later loops — the sentinel just records "we drafted these".
+const AC_AUTODRAFT_START = "<!-- exponential:ac-autodraft v1 start -->";
+const AC_AUTODRAFT_END = "<!-- exponential:ac-autodraft v1 end -->";
+
 export interface TickResult {
   html: string;
   matched: number[];
@@ -38,8 +45,29 @@ export function injectPlanFence(
   currentHtml: string,
   planMarkdown: string,
 ): string {
-  const planHtml = planMarkdownToHtml(planMarkdown);
-  const fencedBlock = `${FENCE_START}\n${planHtml}\n${FENCE_END}`;
+  return injectFence(currentHtml, planMarkdownToHtml(planMarkdown));
+}
+
+/**
+ * Phase 6.5: replace the fence contents with the compact live-status dashboard.
+ * The dashboard HTML is rendered by `dashboard.ts` and passed in verbatim — we
+ * only own the placement (same sentinel fence as the old plan dump).
+ */
+export function injectDashboardFence(
+  currentHtml: string,
+  dashboardHtml: string,
+): string {
+  return injectFence(currentHtml, dashboardHtml);
+}
+
+/**
+ * Insert or replace the inner HTML inside the sentinel fence. The fence and its
+ * contents are the only bytes the orchestrator owns; everything else in
+ * `currentHtml` (the human ask + any auto-drafted AC block above) stays
+ * untouched.
+ */
+function injectFence(currentHtml: string, innerHtml: string): string {
+  const fencedBlock = `${FENCE_START}\n${innerHtml}\n${FENCE_END}`;
 
   const startIdx = currentHtml.indexOf(FENCE_START);
   const endIdx = currentHtml.indexOf(FENCE_END);
@@ -55,6 +83,70 @@ export function injectPlanFence(
     return fencedBlock;
   }
   return `${base}\n${fencedBlock}`;
+}
+
+/**
+ * Remove the plan/dashboard fence (and a single adjoining newline) entirely.
+ * Used on the too-vague bail-out so a description we briefly fenced is left
+ * byte-for-byte as the human wrote it. No-op when no fence is present.
+ */
+export function removeFence(currentHtml: string): string {
+  const startIdx = currentHtml.indexOf(FENCE_START);
+  const endIdx = currentHtml.indexOf(FENCE_END);
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) return currentHtml;
+  let before = currentHtml.slice(0, startIdx);
+  const after = currentHtml.slice(endIdx + FENCE_END.length);
+  if (before.endsWith("\n")) before = before.slice(0, -1);
+  return `${before}${after}`;
+}
+
+/**
+ * Phase 6.5 AC enforcement: does the description already carry an
+ * `## Acceptance Criteria` section (human-authored OR previously auto-drafted)?
+ * We check the plain-text projection so it works regardless of whether Plane
+ * rendered the heading as HTML or left raw markdown.
+ */
+export function hasAcceptanceCriteria(descriptionText: string): boolean {
+  return /acceptance\s+criteria/i.test(descriptionText);
+}
+
+/** True if a prior loop already injected the auto-draft sentinel. */
+export function hasAutodraftedAc(currentHtml: string): boolean {
+  return currentHtml.includes(AC_AUTODRAFT_START);
+}
+
+/**
+ * Inject an auto-drafted Acceptance Criteria block (rendered from the planner's
+ * `ac-draft.md`) into the description, wrapped in provenance sentinels and
+ * placed ABOVE the plan/dashboard fence so it reads as part of the issue body.
+ * No-op (returns input unchanged) if an auto-draft block already exists — we
+ * never re-stomp a block the human may have since edited.
+ *
+ * `acItems` are the bullet texts; we render them as a TipTap task list so the
+ * existing `tickAcceptanceCriteria` (which flips `data-checked`) can tick them
+ * as phases complete.
+ */
+export function injectAutodraftedAc(
+  currentHtml: string,
+  acItems: string[],
+): string {
+  if (hasAutodraftedAc(currentHtml)) return currentHtml;
+  if (acItems.length === 0) return currentHtml;
+
+  const listItems = acItems
+    .map(
+      (text) =>
+        `<li data-type="taskItem" data-checked="false"><p>${formatInline(text)}</p></li>`,
+    )
+    .join("");
+  const block = `${AC_AUTODRAFT_START}<h2>Acceptance Criteria</h2><ul data-type="taskList">${listItems}</ul>${AC_AUTODRAFT_END}`;
+
+  const fenceIdx = currentHtml.indexOf(FENCE_START);
+  if (fenceIdx !== -1) {
+    return `${currentHtml.slice(0, fenceIdx)}${block}\n${currentHtml.slice(fenceIdx)}`;
+  }
+  const base = currentHtml.trim();
+  return base.length === 0 ? block : `${base}\n${block}`;
 }
 
 /**
@@ -217,4 +309,9 @@ function escapeHtml(input: string): string {
     .replace(/'/g, "&#39;");
 }
 
-export const __fenceMarkersForTesting = { FENCE_START, FENCE_END };
+export const __fenceMarkersForTesting = {
+  FENCE_START,
+  FENCE_END,
+  AC_AUTODRAFT_START,
+  AC_AUTODRAFT_END,
+};

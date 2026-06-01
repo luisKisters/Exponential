@@ -1,17 +1,31 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Builder, BuildingError, type BuildResult } from "./builder.js";
+import { Builder, BuildingError, type BuildResult, type PhaseProgressEvent } from "./builder.js";
 import type { Config } from "./config.js";
+import {
+  renderDashboardHtml,
+  type DashboardModel,
+  type DashboardPhase,
+  type PhaseState,
+} from "./dashboard.js";
 import { E2eRunner, type E2eResult } from "./e2e.js";
-import { Git } from "./git.js";
+import { buildBranchName, Git } from "./git.js";
 import type { Logger } from "./logger.js";
+import { injectDashboardFence, removeFence } from "./planeDescription.js";
 import { PRIORITY_RANK, type PlaneApi, type PlaneComment, type PlaneIssue } from "./plane.js";
 import {
   Planner,
   PlanningAbortedError,
   PlanningError,
+  PlanningTooVagueError,
   type PlanResult,
 } from "./planner.js";
+import {
+  Reviewer,
+  type ReviewFixupResult,
+  type ReviewResult,
+  type ReviewStageResult,
+} from "./reviewer.js";
 import type { IssueRow, Store } from "./store.js";
 import {
   deriveGhRepo,
@@ -44,7 +58,10 @@ export class Orchestrator {
   private readonly planner: Planner;
   private readonly builder: Builder;
   private readonly e2e: E2eRunner;
+  private readonly reviewer: Reviewer;
   private readonly git: Git;
+  /** Phase 6.5: live dashboard model for the single in-flight issue. */
+  private dashboard: DashboardModel | null = null;
 
   constructor(
     private readonly logger: Logger,
@@ -55,6 +72,7 @@ export class Orchestrator {
     this.planner = new Planner(logger, config, plane, store);
     this.builder = new Builder(logger, config, plane, store);
     this.e2e = new E2eRunner(logger, config, store);
+    this.reviewer = new Reviewer(logger, config, store);
     this.git = new Git(logger, config.summario.repoPath);
   }
 
@@ -247,6 +265,7 @@ export class Orchestrator {
     this.inFlightPipeline = this.runPipeline(issue).finally(() => {
       delete this.inFlightPipeline;
       this.inFlightIssueId = null;
+      this.dashboard = null;
     });
   }
 
@@ -299,12 +318,14 @@ export class Orchestrator {
       planPath: row.plan_path,
       headSha: row.head_sha ?? "",
       phaseTitles: [],
+      phases: [],
     };
     this.inFlightIssueId = issue.id;
     this.inFlightPipeline = this.continuePipeline(issue, planResult, resumeFrom)
       .finally(() => {
         delete this.inFlightPipeline;
         this.inFlightIssueId = null;
+        this.dashboard = null;
       });
   }
 
@@ -456,10 +477,104 @@ export class Orchestrator {
     };
   }
 
+  // ---------- live dashboard (Phase 6.5) ----------
+
+  private nowUtcHm(): string {
+    const d = new Date();
+    const hh = String(d.getUTCHours()).padStart(2, "0");
+    const mm = String(d.getUTCMinutes()).padStart(2, "0");
+    return `${hh}:${mm} UTC`;
+  }
+
+  /** (Re)build the dashboard model for an issue from a plan result (if any). */
+  private initDashboard(issue: PlaneIssue, planResult: PlanResult | null): void {
+    const branch =
+      planResult?.branch ?? buildBranchName(issue.sequenceId, issue.name);
+    const phases: DashboardPhase[] = (planResult?.phases ?? []).map((p) => ({
+      index: p.index,
+      title: p.title,
+      satisfiesAc: p.satisfiesAc,
+      state: "pending",
+    }));
+    this.dashboard = {
+      shortId: `PLANE-${issue.sequenceId}`,
+      statusLabel: "Planning",
+      detail: null,
+      branch,
+      phases,
+      planRelPath: `.agent/issues/${issue.id}/plan.md`,
+      updatedAtUtc: this.nowUtcHm(),
+    };
+  }
+
   /**
-   * Full pipeline: plan → build → wait-preview → e2e, with up to `maxLoops`
-   * iterations on E2E failure. Each loop re-runs planning with the prior
-   * failure notes folded in.
+   * Merge a patch into the dashboard model and rewrite the Plane description
+   * fence. Best-effort — a Plane failure here must never sink the pipeline.
+   */
+  private async pushDashboard(
+    workItemId: string,
+    patch?: Partial<DashboardModel>,
+  ): Promise<void> {
+    if (!this.dashboard) return;
+    if (patch) this.dashboard = { ...this.dashboard, ...patch };
+    this.dashboard.updatedAtUtc = this.nowUtcHm();
+    try {
+      const detail = await this.plane.retrieveIssue(workItemId);
+      const html = injectDashboardFence(
+        detail.descriptionHtml ?? "",
+        renderDashboardHtml(this.dashboard),
+      );
+      await this.plane.updateDescriptionHtml(workItemId, html);
+      this.store.recordEvent(workItemId, "dashboard_synced", {
+        status: this.dashboard.statusLabel,
+        detail: this.dashboard.detail,
+      });
+    } catch (err) {
+      this.logger.warn(
+        { err, workItemId },
+        "failed to sync dashboard fence (continuing)",
+      );
+    }
+  }
+
+  private setPhaseState(index: number, state: PhaseState): void {
+    if (!this.dashboard) return;
+    this.dashboard.phases = this.dashboard.phases.map((p) =>
+      p.index === index ? { ...p, state } : p,
+    );
+  }
+
+  /** Dashboard callback the builder fires as each plan phase progresses. */
+  private async onBuildProgress(
+    workItemId: string,
+    totalPhases: number,
+    event: PhaseProgressEvent,
+  ): Promise<void> {
+    if (event.type === "phase_start") {
+      this.setPhaseState(event.index, "active");
+      await this.pushDashboard(workItemId, {
+        statusLabel: "Building",
+        detail: `phase ${event.index}/${event.total}`,
+      });
+    } else if (event.type === "phase_complete") {
+      this.setPhaseState(event.index, "done");
+      await this.pushDashboard(workItemId, {
+        statusLabel: "Building",
+        detail: `phase ${event.index}/${totalPhases} complete`,
+      });
+    } else {
+      this.setPhaseState(event.index, "failed");
+      await this.pushDashboard(workItemId, {
+        statusLabel: "Building",
+        detail: `phase ${event.index} failed`,
+      });
+    }
+  }
+
+  /**
+   * Full pipeline: plan → build → review → wait-preview → e2e, with up to
+   * `maxLoops` iterations on E2E failure. Each loop re-runs planning with the
+   * prior failure notes folded in.
    */
   private async runPipeline(issue: PlaneIssue): Promise<void> {
     await this.pipelineLoop(issue, /* planResult */ null, "plan");
@@ -477,13 +592,20 @@ export class Orchestrator {
   private async pipelineLoop(
     issue: PlaneIssue,
     seedPlan: PlanResult | null,
-    startStage: "plan" | "build" | "e2e",
+    startStage: "plan" | "build" | "review" | "e2e",
   ): Promise<void> {
     let loop = 1;
     let planResult: PlanResult | null = seedPlan;
     let buildResult: BuildResult | null = null;
     let priorFailures = "";
     let stage = startStage;
+    // Phase 7: the sha E2E waits a Vercel preview for. Build sets it; the
+    // review stage advances it when a fixup pushes new commits.
+    let headShaForPreview: string | null = seedPlan?.headSha || null;
+
+    // Phase 6.5: initialise the live dashboard (empty phases on resume; the
+    // next planning pass repopulates them).
+    this.initDashboard(issue, seedPlan);
 
     while (loop <= this.config.pipeline.maxLoops) {
       this.logger.info(
@@ -494,6 +616,10 @@ export class Orchestrator {
       if (stage === "plan") {
         if (loop > 1) this.store.resetForLoop(issue.id, loop);
         priorFailures = this.foldInPendingFeedback(issue.id, priorFailures, loop);
+        await this.pushDashboard(issue.id, {
+          statusLabel: "Planning",
+          detail: loop > 1 ? `revision ${loop}` : null,
+        });
         const out = await this.runPlanning(issue, {
           loopNumber: loop,
           priorFailures,
@@ -508,6 +634,13 @@ export class Orchestrator {
         }
         if (!out.ok) return;
         planResult = out.result;
+        headShaForPreview = planResult.headSha || headShaForPreview;
+        // Repopulate the dashboard's phase checklist from the fresh plan.
+        this.initDashboard(issue, planResult);
+        await this.pushDashboard(issue.id, {
+          statusLabel: "Building",
+          detail: `phase 0/${planResult.phases.length}`,
+        });
         stage = "build";
       }
 
@@ -528,12 +661,28 @@ export class Orchestrator {
           return;
         }
         buildResult = out.result;
+        headShaForPreview = buildResult.headSha || headShaForPreview;
+        stage = "review";
+      }
+
+      if (stage === "review") {
+        if (!planResult) return;
+        await this.pushDashboard(issue.id, { statusLabel: "Review", detail: null });
+        const out = await this.runReviewStage(issue, planResult, loop);
+        if (out.aborted) {
+          stage = "plan";
+          continue;
+        }
+        // The review stage is a best-effort quality gate — it never hard-fails
+        // the pipeline. It may advance the head sha (fixup commits) that E2E's
+        // preview should target.
+        if (out.headSha) headShaForPreview = out.headSha;
         stage = "e2e";
       }
 
       if (stage === "e2e") {
         if (!planResult) return;
-        const sha = buildResult?.headSha ?? planResult.headSha;
+        const sha = headShaForPreview || buildResult?.headSha || planResult.headSha;
         if (!sha) {
           await this.finishPipeline(issue, "failed", {
             reason: "no sha to look up vercel preview",
@@ -544,6 +693,10 @@ export class Orchestrator {
           return;
         }
 
+        await this.pushDashboard(issue.id, {
+          statusLabel: "E2E",
+          detail: "deploying preview",
+        });
         const previewOutcome = await this.waitForOrFixupPreview(
           issue,
           planResult,
@@ -568,6 +721,10 @@ export class Orchestrator {
         // Got a working preview — reset the fixup counter for next time.
         this.store.resetPreviewFixupAttempts(issue.id);
 
+        await this.pushDashboard(issue.id, {
+          statusLabel: "E2E",
+          detail: "verifying preview",
+        });
         const out = await this.runE2e(issue, planResult, previewUrl, loop, priorFailures);
         if (out.aborted) {
           stage = "plan";
@@ -679,6 +836,49 @@ export class Orchestrator {
         );
         return { ok: false, aborted: true };
       }
+      if (err instanceof PlanningTooVagueError) {
+        // Phase 6.5: the issue has no ACs and is too thin to draft any. Per the
+        // queue-safety decision we mark the SQLite row failed (so the
+        // orchestrator isn't permanently blocked), but we do NOT move the Plane
+        // state — the issue is "left alone" for the human to expand. We also
+        // strip any dashboard fence we created so the description is untouched.
+        this.logger.warn(
+          { workItemId: issue.id, loop: opts.loopNumber },
+          "planning bailed: description too vague to extract acceptance criteria",
+        );
+        this.dashboard = null;
+        try {
+          const detail = await this.plane.retrieveIssue(issue.id);
+          const stripped = removeFence(detail.descriptionHtml ?? "");
+          if (stripped !== (detail.descriptionHtml ?? "")) {
+            await this.plane.updateDescriptionHtml(issue.id, stripped);
+          }
+        } catch {
+          // best-effort
+        }
+        this.store.markPlanningFailed(
+          issue.id,
+          "description too vague to extract acceptance criteria",
+        );
+        this.store.recordEvent(issue.id, "planning_failed", {
+          reason: "too_vague",
+          loop: opts.loopNumber,
+        });
+        try {
+          const c = await this.plane.postComment(
+            issue.id,
+            `<p><strong>Cannot plan this issue yet.</strong> The description is too vague to extract acceptance criteria. Please add a <code>## Acceptance Criteria</code> section or expand the description with concrete, verifiable behaviour, then move the issue back to <em>In Progress</em>.</p>`,
+          );
+          this.store.advanceCommentWatermark(issue.id, c.createdAt);
+        } catch {
+          // best-effort
+        }
+        return {
+          ok: false,
+          aborted: false,
+          reason: "description too vague to extract acceptance criteria",
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(
         { err, workItemId: issue.id, sequenceId: issue.sequenceId },
@@ -721,6 +921,8 @@ export class Orchestrator {
         worktreePath: planResult.worktreePath,
         planRelPath: planResult.planPath,
         signal: stageAbort.signal,
+        onProgress: (event) =>
+          this.onBuildProgress(issue.id, planResult.phases.length, event),
       });
       this.logger.info(
         {
@@ -1010,6 +1212,150 @@ export class Orchestrator {
     }
   }
 
+  // ---------- review stage (Phase 7) ----------
+
+  /**
+   * Phase 7: review hop between Build and E2E. Run an initial review; if it
+   * surfaces findings, run a fixup session then re-review once. The stage is a
+   * best-effort quality gate — it never hard-fails the pipeline (remaining
+   * findings just stay in review.md for the human). It returns the latest
+   * pushed sha so E2E's preview targets the post-fixup commit.
+   */
+  private async runReviewStage(
+    issue: PlaneIssue,
+    planResult: PlanResult,
+    loop: number,
+  ): Promise<ReviewStageResult> {
+    let headSha: string | null = null;
+
+    const r1 = await this.runReviewSession(issue, planResult, loop, "initial");
+    if (r1.aborted) return { aborted: true, headSha: null };
+    if (r1.headSha) headSha = r1.headSha;
+
+    if (r1.verdict !== "review-findings") {
+      this.store.recordEvent(issue.id, "review_clean", {
+        pass: "initial",
+        verdict: r1.verdict,
+        findings: r1.findingsCount,
+      });
+      return { aborted: false, headSha };
+    }
+
+    this.store.recordEvent(issue.id, "review_findings", {
+      findings: r1.findingsCount,
+    });
+    await this.pushDashboard(issue.id, {
+      statusLabel: "Review",
+      detail: "addressing findings",
+    });
+
+    const fx = await this.runReviewFixupSession(issue, planResult, loop);
+    if (fx.aborted) return { aborted: true, headSha: null };
+    if (fx.pushedSha) headSha = fx.pushedSha;
+
+    await this.pushDashboard(issue.id, {
+      statusLabel: "Review",
+      detail: "re-checking",
+    });
+    const r2 = await this.runReviewSession(issue, planResult, loop, "recheck");
+    if (r2.aborted) return { aborted: true, headSha: null };
+    if (r2.headSha) headSha = r2.headSha;
+
+    if (r2.verdict === "review-findings") {
+      this.logger.info(
+        { workItemId: issue.id, findings: r2.findingsCount },
+        "review still has findings after fixup; proceeding to E2E anyway",
+      );
+      this.store.recordEvent(issue.id, "review_proceeding_with_findings", {
+        findings: r2.findingsCount,
+      });
+    } else {
+      this.store.recordEvent(issue.id, "review_clean_after_fixup", {
+        verdict: r2.verdict,
+      });
+    }
+    return { aborted: false, headSha };
+  }
+
+  private async runReviewSession(
+    issue: PlaneIssue,
+    planResult: PlanResult,
+    loop: number,
+    pass: "initial" | "recheck",
+  ): Promise<ReviewResult> {
+    const stageAbort = this.registerStageAbort(issue.id);
+    try {
+      const detail = await this.plane.retrieveIssue(issue.id);
+      return await this.reviewer.review({
+        issue: detail,
+        branch: planResult.branch,
+        worktreePath: planResult.worktreePath,
+        planRelPath: planResult.planPath,
+        loopNumber: loop,
+        pass,
+        signal: stageAbort.signal,
+      });
+    } catch (err) {
+      // A review failure must not sink the pipeline — log and proceed as if
+      // there were no actionable findings.
+      this.logger.error(
+        { err, workItemId: issue.id, pass },
+        "review session threw; treating as no-verdict",
+      );
+      this.store.recordEvent(issue.id, "review_threw", {
+        pass,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        verdict: "no-verdict",
+        findingsCount: 0,
+        aborted: false,
+        doneFlagSeen: false,
+        timedOut: false,
+        headSha: null,
+      };
+    } finally {
+      stageAbort.release();
+    }
+  }
+
+  private async runReviewFixupSession(
+    issue: PlaneIssue,
+    planResult: PlanResult,
+    loop: number,
+  ): Promise<ReviewFixupResult> {
+    const stageAbort = this.registerStageAbort(issue.id);
+    try {
+      const detail = await this.plane.retrieveIssue(issue.id);
+      return await this.reviewer.fixup({
+        issue: detail,
+        branch: planResult.branch,
+        worktreePath: planResult.worktreePath,
+        planRelPath: planResult.planPath,
+        loopNumber: loop,
+        signal: stageAbort.signal,
+      });
+    } catch (err) {
+      this.logger.error(
+        { err, workItemId: issue.id },
+        "review fixup session threw; skipping",
+      );
+      this.store.recordEvent(issue.id, "review_fixup_threw", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        verdict: "error",
+        aborted: false,
+        doneFlagSeen: false,
+        advancedHead: false,
+        newHeadSha: "",
+        pushedSha: null,
+      };
+    } finally {
+      stageAbort.release();
+    }
+  }
+
   /**
    * Single exit point for the pipeline. Handles Plane state transition, the
    * final comment, sqlite status, and optional worktree cleanup.
@@ -1030,6 +1376,13 @@ export class Orchestrator {
       outcome === "human_review"
         ? this.config.plane.humanReviewStatus
         : this.config.plane.failedStatus;
+
+    // Phase 6.5: flip the dashboard to its terminal status before we mutate
+    // SQLite/Plane state, so the fence reflects the final outcome.
+    await this.pushDashboard(issue.id, {
+      statusLabel: outcome === "human_review" ? "Human Review" : "Failed",
+      detail: null,
+    });
 
     if (outcome === "human_review") {
       this.store.markHumanReview(issue.id, { previewUrl: input.previewUrl });

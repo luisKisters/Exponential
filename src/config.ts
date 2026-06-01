@@ -47,6 +47,10 @@ export interface Config {
     /** Hard timeout per E2E Claude session. */
     timeoutMs: number;
   };
+  review: {
+    /** Phase 7: hard timeout per review Claude session (review + recheck). */
+    timeoutMs: number;
+  };
   pipeline: {
     /** Max number of full plan→build→e2e loops before giving up. */
     maxLoops: number;
@@ -136,6 +140,9 @@ export function loadConfig(): Config {
     },
     e2e: {
       timeoutMs: int("E2E_TIMEOUT_MS", 20 * 60_000),
+    },
+    review: {
+      timeoutMs: int("REVIEW_TIMEOUT_MS", 15 * 60_000),
     },
     pipeline: {
       maxLoops: int("MAX_PIPELINE_LOOPS", 3),

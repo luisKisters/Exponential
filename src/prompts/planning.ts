@@ -21,6 +21,14 @@ export interface PlanningPromptInput {
   loopNumber?: number;
   /** Notes from prior E2E failures (used when re-planning). */
   priorFailures?: string;
+  /**
+   * Phase 6.5: whether the issue already carries a `## Acceptance Criteria`
+   * section. When false the agent must draft one (or declare the issue too
+   * vague to plan).
+   */
+  hasAcceptanceCriteria?: boolean;
+  /** Phase 6.5: repo-relative path where the agent writes drafted ACs. */
+  acDraftRelPath?: string;
 }
 
 export function buildPlanningPrompt(input: PlanningPromptInput): string {
@@ -34,6 +42,8 @@ export function buildPlanningPrompt(input: PlanningPromptInput): string {
     branch,
     loopNumber = 1,
     priorFailures = "",
+    hasAcceptanceCriteria = true,
+    acDraftRelPath = "",
   } = input;
 
   const description = descriptionText.trim().length > 0
@@ -44,7 +54,16 @@ export function buildPlanningPrompt(input: PlanningPromptInput): string {
     ? `\n# Revise the plan to address the notes below\n\nThe notes may be reviewer feedback left on the Plane issue while the agent was working, an E2E failure from a prior loop, or both. Read every section carefully and revise the plan so the next build attempt addresses them — don't just re-emit the same phases. ${loopNumber > 1 ? `(Loop ${loopNumber}.)` : ""}\n\n${priorFailures.trim()}\n`
     : "";
 
-  return `You are the **Planning Agent** for the Exponential autonomous coding pipeline. You are running inside a fresh git worktree of the summario repo, checked out on the branch \`${branch}\`.${revisionBlock}
+  // Phase 6.5: AC enforcement. When the issue has no `## Acceptance Criteria`,
+  // the agent must either draft one (so the build stage has something to tick
+  // and the E2E agent something to verify), or — if the description is too thin
+  // to extract any testable behaviour — bail out with the `too-vague` verdict
+  // instead of producing a plan against a guess.
+  const acEnforcementBlock = hasAcceptanceCriteria
+    ? ""
+    : `\n# This issue has NO Acceptance Criteria — you must handle that first\n\nThe issue body has no \`## Acceptance Criteria\` section. Before planning, decide:\n\n- **If the description describes enough concrete, testable behaviour to draft criteria:** write 2–5 acceptance criteria to **exactly** \`${acDraftRelPath}\` (relative to repo root) as a markdown checklist, one per line:\n\n  \`\`\`markdown\n  - [ ] <concrete, browser-verifiable criterion>\n  - [ ] <another>\n  \`\`\`\n\n  Each criterion must be observable on the deployed app (something the E2E agent can check), not an implementation detail. Then continue with the normal planning flow below, and reference these drafted AC numbers in each phase's \`Satisfies AC\` line. The orchestrator injects your draft into the Plane issue.\n- **If the description is too vague** (a one-liner, no concrete behaviour, nothing you could verify in a browser): do NOT write a plan and do NOT write \`${acDraftRelPath}\`. Instead skip straight to the "When you are done" step and write the done flag with \`too-vague\` as its single line. The orchestrator will ask the human to expand the issue.\n`;
+
+  return `You are the **Planning Agent** for the Exponential autonomous coding pipeline. You are running inside a fresh git worktree of the summario repo, checked out on the branch \`${branch}\`.${revisionBlock}${acEnforcementBlock}
 
 # Your task
 
@@ -115,7 +134,8 @@ You may also append helpful context to \`${memoryRelPath}\` (e.g. things the Bui
 
 After you have written \`${planRelPath}\` and reviewed it once for completeness, write the file \`${doneFlagRelPath}\` containing a single line:
 
-\`plan-ready\`
+- \`plan-ready\` — you produced a phased plan (this is the normal case).
+- \`too-vague\` — *only* if the issue had no Acceptance Criteria AND the description was too thin to draft any. In this case you did not write \`${planRelPath}\`.
 
 Then stop. The orchestrator polls for that flag file and will close this session as soon as it appears. Do NOT commit, push, or open a PR — the orchestrator handles git afterwards.
 

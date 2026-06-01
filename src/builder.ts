@@ -8,7 +8,6 @@ import type { Logger } from "./logger.js";
 import { appendMemorySection, ensureMemoryFile, formatPhaseSection } from "./memory.js";
 import { parseAcList, parsePlanPhases } from "./plan.js";
 import {
-  injectPlanFence,
   tickAcceptanceCriteria,
   type TickResult,
 } from "./planeDescription.js";
@@ -17,6 +16,15 @@ import { runPnpmBuild } from "./pnpm.js";
 import { buildPhasePrompt } from "./prompts/buildPhase.js";
 import { buildFixupPrompt } from "./prompts/buildFixup.js";
 import type { Store } from "./store.js";
+
+/**
+ * Phase 6.5: per-phase progress event the builder emits so the orchestrator can
+ * keep the live dashboard fence in sync as each phase starts / finishes.
+ */
+export type PhaseProgressEvent =
+  | { type: "phase_start"; index: number; total: number; title: string }
+  | { type: "phase_complete"; index: number }
+  | { type: "phase_failed"; index: number };
 
 export interface BuildInput {
   /** Plane work item (already retrieved with description). */
@@ -27,6 +35,8 @@ export interface BuildInput {
   planRelPath: string;
   /** Optional abort signal for reviewer-feedback interruption. */
   signal?: AbortSignal;
+  /** Phase 6.5: dashboard progress callback (best-effort; errors are swallowed). */
+  onProgress?: (event: PhaseProgressEvent) => Promise<void> | void;
 }
 
 export interface BuildResult {
@@ -125,8 +135,15 @@ export class Builder {
    * stops (later phases are not started).
    */
   async build(input: BuildInput): Promise<BuildResult> {
-    const { issue, branch, worktreePath, planRelPath, signal } = input;
+    const { issue, branch, worktreePath, planRelPath, signal, onProgress } = input;
     const shortId = `PLANE-${issue.sequenceId}`;
+    const emitProgress = async (event: PhaseProgressEvent): Promise<void> => {
+      try {
+        await onProgress?.(event);
+      } catch (err) {
+        this.logger.warn({ err, event }, "phase progress callback threw");
+      }
+    };
 
     this.store.markBuilding(issue.id);
     this.store.recordEvent(issue.id, "building_started", { branch, worktreePath });
@@ -178,6 +195,12 @@ export class Builder {
     let buildFailed = false;
 
     for (const phase of planPhases) {
+      await emitProgress({
+        type: "phase_start",
+        index: phase.index,
+        total: planPhases.length,
+        title: phase.title,
+      });
       let attempt = 0;
       let phaseOk = false;
       let priorPhaseFailures = "";
@@ -326,6 +349,11 @@ export class Builder {
         phaseOk ? "build_phase_complete" : "build_phase_failed",
         { phase: phase.index, attempts: attempt },
       );
+      await emitProgress(
+        phaseOk
+          ? { type: "phase_complete", index: phase.index }
+          : { type: "phase_failed", index: phase.index },
+      );
 
       // Commit this phase from the orchestrator side (don't trust the agent to
       // commit). done.flag / phase-report.md are already removed so they don't
@@ -392,7 +420,7 @@ export class Builder {
     // Sync Plane description: inject plan inside fence and tick satisfied ACs.
     let tickResult: TickResult | null = null;
     try {
-      tickResult = await this.syncPlaneDescription(issue.id, planMarkdown, outcomes);
+      tickResult = await this.syncPlaneDescription(issue.id, outcomes);
     } catch (err) {
       this.logger.warn(
         { err, workItemId: issue.id },
@@ -606,14 +634,14 @@ export class Builder {
 
   private async syncPlaneDescription(
     workItemId: string,
-    planMarkdown: string,
     phases: PhaseOutcome[],
   ): Promise<TickResult> {
     const detail = await this.plane.retrieveIssue(workItemId);
     const currentHtml = detail.descriptionHtml ?? "";
 
-    const withPlan = injectPlanFence(currentHtml, planMarkdown);
-
+    // Phase 6.5: the dashboard fence is owned by the orchestrator now, so the
+    // builder no longer dumps the plan into the description — it only ticks the
+    // human-facing AC checkboxes (which live ABOVE the fence).
     const satisfied = new Set<number>();
     for (const phase of phases) {
       if (phase.status !== "complete") continue;
@@ -621,7 +649,7 @@ export class Builder {
     }
     const indices = [...satisfied].sort((a, b) => a - b);
 
-    const tickResult = tickAcceptanceCriteria(withPlan, indices);
+    const tickResult = tickAcceptanceCriteria(currentHtml, indices);
     await this.plane.updateDescriptionHtml(workItemId, tickResult.html);
 
     if (tickResult.skipped.length > 0) {
@@ -648,7 +676,7 @@ async function safeRead(path: string): Promise<string | null> {
   }
 }
 
-async function linkRepoArtifacts(
+export async function linkRepoArtifacts(
   logger: Logger,
   input: { sourceRepo: string; worktreePath: string },
 ): Promise<void> {

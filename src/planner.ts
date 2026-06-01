@@ -5,8 +5,11 @@ import { ClaudeSession } from "./claude.js";
 import type { Config } from "./config.js";
 import { buildBranchName, buildWorktreePath, Git } from "./git.js";
 import type { Logger } from "./logger.js";
-import { extractPhaseTitles } from "./plan.js";
-import { injectPlanFence } from "./planeDescription.js";
+import { parsePlanPhases, type ParsedPhase } from "./plan.js";
+import {
+  hasAcceptanceCriteria,
+  injectAutodraftedAc,
+} from "./planeDescription.js";
 import type { PlaneApi, PlaneIssue } from "./plane.js";
 import { buildPlanningPrompt } from "./prompts/planning.js";
 import type { Store } from "./store.js";
@@ -25,6 +28,8 @@ export interface PlanResult {
   worktreePath: string;
   planPath: string;
   phaseTitles: string[];
+  /** Phase 6.5: parsed phases (index/title/satisfiesAc) for the dashboard. */
+  phases: ParsedPhase[];
   /** Sha that was pushed to the remote. */
   headSha: string;
 }
@@ -90,10 +95,11 @@ export class Planner {
     const planAbsPath = join(issueDir, "plan.md");
     const memoryAbsPath = join(issueDir, "memory.md");
     const doneFlagAbsPath = join(issueDir, "done.flag");
+    const acDraftAbsPath = join(issueDir, "ac-draft.md");
 
     // If a previous run left these around, clear them so we get a fresh
     // signal.
-    for (const p of [planAbsPath, doneFlagAbsPath]) {
+    for (const p of [planAbsPath, doneFlagAbsPath, acDraftAbsPath]) {
       if (existsSync(p)) {
         await rm(p);
       }
@@ -103,6 +109,12 @@ export class Planner {
     const planRelPath = relative(worktreePath, planAbsPath);
     const memoryRelPath = relative(worktreePath, memoryAbsPath);
     const doneFlagRelPath = relative(worktreePath, doneFlagAbsPath);
+    const acDraftRelPath = relative(worktreePath, acDraftAbsPath);
+
+    // Phase 6.5: only the human-authored section counts as "already has AC".
+    // On retry loops the auto-drafted section is already part of the
+    // description text, so this naturally returns true and we don't re-draft.
+    const acAlreadyPresent = hasAcceptanceCriteria(detail.descriptionText);
 
     const prompt = buildPlanningPrompt({
       workItemId: issue.id,
@@ -116,6 +128,8 @@ export class Planner {
       branch,
       loopNumber: opts.loopNumber ?? 1,
       priorFailures: opts.priorFailures ?? "",
+      hasAcceptanceCriteria: acAlreadyPresent,
+      acDraftRelPath,
     });
 
     this.store.recordEvent(issue.id, "claude_session_started", {
@@ -158,6 +172,18 @@ export class Planner {
       });
     }
 
+    // Phase 6.5: the agent signals an un-plannable issue via `too-vague`.
+    const verdict = (await readFlag(doneFlagAbsPath)).trim().split(/\s+/)[0] ?? "";
+    if (verdict === "too-vague") {
+      this.store.recordEvent(issue.id, "planning_too_vague", {
+        loopNumber: opts.loopNumber ?? 1,
+      });
+      throw new PlanningTooVagueError(
+        "issue description is too vague to extract acceptance criteria",
+        { worktreePath, branch, transcript: result.transcript },
+      );
+    }
+
     if (!existsSync(planAbsPath)) {
       throw new PlanningError(
         `planning agent did not write expected plan file at ${planRelPath}`,
@@ -166,8 +192,9 @@ export class Planner {
     }
 
     const planMarkdown = await readFile(planAbsPath, "utf8");
-    const phaseTitles = extractPhaseTitles(planMarkdown);
-    if (phaseTitles.length === 0) {
+    const phases = parsePlanPhases(planMarkdown);
+    const phaseTitles = phases.map((p) => p.title);
+    if (phases.length === 0) {
       throw new PlanningError(
         `plan.md exists but contains no recognisable "## Phase N" headings`,
         { worktreePath, branch, transcript: result.transcript },
@@ -205,24 +232,37 @@ export class Planner {
       phases: phaseTitles.length,
     });
 
-    // Inject the plan into the Plane description fence. This makes the
-    // revised plan visible above the comment stream — important after retries
-    // (Phase 4 loops back here with a revised plan).
-    try {
-      const refreshed = await this.plane.retrieveIssue(issue.id);
-      const newHtml = injectPlanFence(refreshed.descriptionHtml ?? "", planMarkdown);
-      await this.plane.updateDescriptionHtml(issue.id, newHtml);
-      this.store.recordEvent(issue.id, "plan_fence_synced", {
-        loopNumber: opts.loopNumber ?? 1,
-      });
-    } catch (err) {
-      this.logger.warn(
-        { err, workItemId: issue.id },
-        "failed to sync plan into Plane description (continuing)",
-      );
-      this.store.recordEvent(issue.id, "plan_fence_sync_failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+    // Phase 6.5: if the issue had no human AC and the agent drafted some,
+    // inject them above the fence (with a provenance sentinel). The orchestrator
+    // owns the dashboard fence itself, so the planner no longer dumps the plan
+    // into the description. injectAutodraftedAc is a no-op once the sentinel
+    // exists, so retry loops never re-stomp it.
+    if (!acAlreadyPresent) {
+      const acItems = await readAcDraft(acDraftAbsPath);
+      if (acItems.length > 0) {
+        try {
+          const refreshed = await this.plane.retrieveIssue(issue.id);
+          const newHtml = injectAutodraftedAc(
+            refreshed.descriptionHtml ?? "",
+            acItems,
+          );
+          if (newHtml !== (refreshed.descriptionHtml ?? "")) {
+            await this.plane.updateDescriptionHtml(issue.id, newHtml);
+            this.store.recordEvent(issue.id, "ac_autodrafted", {
+              count: acItems.length,
+              loopNumber: opts.loopNumber ?? 1,
+            });
+          }
+        } catch (err) {
+          this.logger.warn(
+            { err, workItemId: issue.id },
+            "failed to inject auto-drafted acceptance criteria (continuing)",
+          );
+          this.store.recordEvent(issue.id, "ac_autodraft_failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     }
 
     const planComment = await this.plane.postComment(
@@ -242,9 +282,39 @@ export class Planner {
       worktreePath,
       planPath: planPathRecord,
       phaseTitles,
+      phases,
       headSha,
     };
   }
+}
+
+/** Read the done.flag verdict, tolerating a missing file. */
+async function readFlag(path: string): Promise<string> {
+  try {
+    return await readFile(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Parse the planner's `ac-draft.md` into bullet texts. Accepts `- [ ] foo`,
+ * `* foo`, or plain `- foo` lines; ignores headings / blank lines. Caps at 5
+ * (the PRD's draft ceiling) so a runaway draft can't flood the description.
+ */
+async function readAcDraft(path: string): Promise<string[]> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return [];
+  }
+  const items: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const m = /^\s*[-*]\s+(?:\[[ xX]\]\s+)?(.+?)\s*$/.exec(line);
+    if (m && m[1] && m[1].trim().length > 0) items.push(m[1].trim());
+  }
+  return items.slice(0, 5);
 }
 
 export class PlanningError extends Error {
@@ -258,6 +328,26 @@ export class PlanningError extends Error {
   ) {
     super(message);
     this.name = "PlanningError";
+  }
+}
+
+/**
+ * Phase 6.5: thrown when the issue has no Acceptance Criteria and the
+ * description is too thin to draft any. The orchestrator handles this
+ * distinctly from a generic PlanningError — it posts a "please add ACs"
+ * comment and does not loop.
+ */
+export class PlanningTooVagueError extends Error {
+  constructor(
+    message: string,
+    public readonly details: {
+      worktreePath: string;
+      branch: string;
+      transcript: string;
+    },
+  ) {
+    super(message);
+    this.name = "PlanningTooVagueError";
   }
 }
 
