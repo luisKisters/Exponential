@@ -41,12 +41,12 @@ RUN apt-get update \
 
 # Full install (incl. devDeps) — needed for `tsc` in the build stage.
 FROM toolchain AS deps
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 # Production-only install — what actually ships in the runtime image.
 FROM toolchain AS prod-deps
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --prod --frozen-lockfile
 
 FROM deps AS build
