@@ -1,0 +1,81 @@
+# Phase 8 — Coolify deployment.
+#
+# Coolify can deploy this repo directly from this compose file (Build Pack:
+# "Docker Compose"). It builds the Dockerfile, wires the volumes below, and
+# injects environment variables from the Coolify UI (which supersede any
+# `.env`). The five env vars Coolify must hold as *secrets* are called out in
+# the `environment:` block; everything else has a sane default in the image or
+# config.ts.
+#
+# Before the first deploy, the `summario` mount must point at a *pre-installed*
+# clone of the target repo: the builder symlinks `<summario>/.env` and
+# `<summario>/node_modules` into each worktree, so `pnpm install` must already
+# have been run there. The `claude-config` volume must hold a Claude Code login
+# (run `claude` once via `docker exec -it <container> claude` to authenticate;
+# it persists in CLAUDE_CONFIG_DIR).
+
+services:
+  exponential:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Coolify injects env from its UI; env_file is the local-compose fallback.
+    env_file:
+      - .env
+    environment:
+      # --- secrets (set these in Coolify) ---
+      - PLANE_API_KEY=${PLANE_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - VERCEL_TOKEN=${VERCEL_TOKEN}
+      - VERCEL_PROTECTION_BYPASS=${VERCEL_PROTECTION_BYPASS}
+      - MOCK_TEST_USER_PASSWORD=${MOCK_TEST_USER_PASSWORD}
+      # --- non-secret config (also settable in Coolify) ---
+      - PLANE_BASE_URL=${PLANE_BASE_URL}
+      - PLANE_WORKSPACE_SLUG=${PLANE_WORKSPACE_SLUG}
+      - PLANE_PROJECT_ID=${PLANE_PROJECT_ID}
+      - SUMMARIO_GITHUB_REPO=${SUMMARIO_GITHUB_REPO}
+      - MOCK_TEST_USER_EMAIL=${MOCK_TEST_USER_EMAIL}
+      - POLL_INTERVAL_MS=${POLL_INTERVAL_MS:-30000}
+      - MAX_PIPELINE_LOOPS=${MAX_PIPELINE_LOOPS:-3}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Container-internal paths (match the Dockerfile defaults; pinned here so
+      # they can't drift):
+      - SUMMARIO_REPO_PATH=/summario
+      - WORKTREE_BASE_PATH=/workspaces
+      - DATABASE_PATH=/app/data/exponential.sqlite
+      - CLAUDE_CONFIG_DIR=/app/claude-config
+      - HEALTH_PORT=8080
+    volumes:
+      - exponential-data:/app/data
+      - exponential-workspaces:/workspaces
+      - claude-config:/app/claude-config
+      # Pre-installed summario clone (operator-supplied). Swap for a named
+      # volume if you clone+install into it out of band.
+      - ${SUMMARIO_HOST_PATH:-./summario}:/summario
+      # Deploy key for git push over SSH (read-only). Mount the dir so
+      # known_hosts comes along; keep StrictHostKeyChecking sane on the host.
+      - ${SSH_DIR_HOST_PATH:-~/.ssh}:/root/.ssh:ro
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+volumes:
+  exponential-data:
+  exponential-workspaces:
+  claude-config:

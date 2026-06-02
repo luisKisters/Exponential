@@ -19,6 +19,12 @@ export interface Config {
   claude: {
     binary: string;
     timeoutMs: number;
+    /** Nudge a quiet Claude TUI after this much time without output. */
+    inactivityNudgeMs: number;
+    /** Kill a quiet Claude TUI after this much time without output. */
+    inactivityTimeoutMs: number;
+    /** Use Claude's non-interactive print mode instead of the interactive TUI. */
+    usePrintMode: boolean;
     extraArgs: string[];
   };
   builder: {
@@ -59,6 +65,12 @@ export interface Config {
   };
   /** Optional mock test user the E2E agent signs in with. */
   mockUser: { email: string; password: string } | null;
+  /** Phase 8: HTTP health endpoint for container orchestration (Docker / Coolify). */
+  health: {
+    /** Port to listen on. 0 disables the health server entirely. */
+    port: number;
+    host: string;
+  };
   pollIntervalMs: number;
   /** Phase 4.5: how often to poll Plane comments for reviewer feedback. */
   commentPollIntervalMs: number;
@@ -95,6 +107,16 @@ function int(name: string, fallback: number): number {
   return parsed;
 }
 
+function nonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === "") return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    throw new Error(`Invalid non-negative integer for ${name}: ${raw}`);
+  }
+  return parsed;
+}
+
 export function loadConfig(): Config {
   const mockEmail = optional("MOCK_TEST_USER_EMAIL", "");
   const mockPw = optional("MOCK_TEST_USER_PASSWORD", "");
@@ -121,6 +143,12 @@ export function loadConfig(): Config {
     claude: {
       binary: optional("CLAUDE_BINARY", "claude"),
       timeoutMs: int("CLAUDE_TIMEOUT_MS", 30 * 60_000),
+      inactivityNudgeMs: nonNegativeInt("CLAUDE_INACTIVITY_NUDGE_MS", 5 * 60_000),
+      inactivityTimeoutMs: nonNegativeInt(
+        "CLAUDE_INACTIVITY_TIMEOUT_MS",
+        8 * 60_000,
+      ),
+      usePrintMode: optional("CLAUDE_USE_PRINT_MODE", "true").toLowerCase() !== "false",
       extraArgs: optional("CLAUDE_EXTRA_ARGS", "")
         .split(/\s+/)
         .filter((s) => s.length > 0),
@@ -150,6 +178,10 @@ export function loadConfig(): Config {
         optional("CLEAN_WORKTREE_ON_FINISH", "false").toLowerCase() === "true",
     },
     mockUser,
+    health: {
+      port: nonNegativeInt("HEALTH_PORT", 8080),
+      host: optional("HEALTH_HOST", "0.0.0.0"),
+    },
     pollIntervalMs: int("POLL_INTERVAL_MS", 30_000),
     commentPollIntervalMs: int("COMMENT_POLL_INTERVAL_MS", 10_000),
     databasePath: optional("DATABASE_PATH", "./data/exponential.sqlite"),

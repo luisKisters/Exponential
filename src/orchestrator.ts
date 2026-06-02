@@ -40,6 +40,18 @@ type StageOutcome<T> =
   | { ok: false; aborted: true }
   | { ok: false; aborted: false; reason: string };
 
+/** Phase 8: snapshot served by the HTTP health endpoint (see `health.ts`). */
+export interface HealthSnapshot {
+  /** `ok`/`starting` map to HTTP 200; `stale`/`stopped` map to 503. */
+  status: "ok" | "starting" | "stale" | "stopped";
+  startedAt: string | null;
+  uptimeSeconds: number | null;
+  lastCycleAt: string | null;
+  lastCycleOk: boolean;
+  inFlightIssueId: string | null;
+  pollIntervalMs: number;
+}
+
 export class Orchestrator {
   private timer?: NodeJS.Timeout;
   private feedbackTimer?: NodeJS.Timeout;
@@ -48,6 +60,10 @@ export class Orchestrator {
   private inFlightPipeline?: Promise<void>;
   private inFlightIssueId: string | null = null;
   private stopped = false;
+  /** Phase 8 health: when start() completed, and when the last poll cycle finished. */
+  private startedAt: Date | null = null;
+  private lastCycleAt: Date | null = null;
+  private lastCycleOk = true;
   private inProgressStateId: string | undefined;
   private humanReviewStateId: string | undefined;
   private failedStateId: string | undefined;
@@ -77,6 +93,7 @@ export class Orchestrator {
   }
 
   async start(): Promise<void> {
+    this.startedAt = new Date();
     await this.planner.ensureReady();
     this.inProgressStateId = await this.plane.findStateIdByName(
       this.config.plane.inProgressStatus,
@@ -128,6 +145,15 @@ export class Orchestrator {
       clearInterval(this.feedbackTimer);
       delete this.feedbackTimer;
     }
+    if (this.stageAborters.size > 0) {
+      this.logger.info(
+        { activeIssues: this.stageAborters.size },
+        "aborting active claude sessions for shutdown",
+      );
+      for (const aborters of this.stageAborters.values()) {
+        for (const ctrl of aborters) ctrl.abort();
+      }
+    }
     if (this.inFlightCycle) {
       this.logger.info("waiting for in-flight poll cycle to finish");
       await new Promise<void>((resolve) => {
@@ -145,14 +171,49 @@ export class Orchestrator {
     this.logger.info("orchestrator stopped");
   }
 
+  /**
+   * Phase 8: liveness snapshot for the HTTP health endpoint. The loop is "stale"
+   * if no poll cycle has finished within 3 poll intervals (min 90s) — `runCycle`
+   * fires on the timer every interval and `pollOnce` returns fast even while a
+   * pipeline runs, so a missed cycle means the event loop is genuinely wedged.
+   */
+  getHealth(): HealthSnapshot {
+    const now = Date.now();
+    const staleAfterMs = Math.max(this.config.pollIntervalMs * 3, 90_000);
+    let status: HealthSnapshot["status"];
+    if (this.stopped) {
+      status = "stopped";
+    } else if (!this.startedAt || !this.lastCycleAt) {
+      status = "starting";
+    } else if (now - this.lastCycleAt.getTime() > staleAfterMs) {
+      status = "stale";
+    } else {
+      status = "ok";
+    }
+    return {
+      status,
+      startedAt: this.startedAt?.toISOString() ?? null,
+      uptimeSeconds: this.startedAt
+        ? Math.floor((now - this.startedAt.getTime()) / 1000)
+        : null,
+      lastCycleAt: this.lastCycleAt?.toISOString() ?? null,
+      lastCycleOk: this.lastCycleOk,
+      inFlightIssueId: this.inFlightIssueId,
+      pollIntervalMs: this.config.pollIntervalMs,
+    };
+  }
+
   private async runCycle(): Promise<void> {
     if (this.inFlightCycle || this.stopped) return;
     this.inFlightCycle = true;
     try {
       await this.pollOnce();
+      this.lastCycleOk = true;
     } catch (err) {
+      this.lastCycleOk = false;
       this.logger.error({ err }, "poll cycle failed");
     } finally {
+      this.lastCycleAt = new Date();
       this.inFlightCycle = false;
       if (this.stopped && this.resolveStop) {
         this.resolveStop();
@@ -270,18 +331,23 @@ export class Orchestrator {
   }
 
   /**
-   * Restart recovery: if an issue was left in a resumable state (`planned`
-   * after planning, `built` after building), resume from the appropriate
-   * stage. Pre-checks Plane to skip safely if the issue was deleted.
+   * Restart recovery: if an issue was left in a recoverable non-terminal
+   * state, resume from the earliest stage that can safely reconstruct the
+   * missing in-memory state. Pre-checks Plane to skip safely if the issue was
+   * deleted.
    */
   private async resumeOrphans(): Promise<void> {
     const resumable = this.store.findResumableIssue();
     if (!resumable) return;
     const { row, resumeFrom } = resumable;
-    if (!row.branch_name || !row.worktree_path || !row.plan_path) {
+    if (
+      !row.branch_name ||
+      !row.worktree_path ||
+      (resumeFrom !== "plan" && !row.plan_path)
+    ) {
       this.logger.warn(
         { workItemId: row.plane_work_item_id, status: row.status },
-        "resumable row is missing branch/worktree/plan path; skipping recovery",
+        "resumable row is missing required branch/worktree/plan path; skipping recovery",
       );
       return;
     }
@@ -312,14 +378,17 @@ export class Orchestrator {
       "resuming orphaned issue",
     );
     const issue = issueFromRow(row, this.inProgressStateId);
-    const planResult: PlanResult = {
-      branch: row.branch_name,
-      worktreePath: row.worktree_path,
-      planPath: row.plan_path,
-      headSha: row.head_sha ?? "",
-      phaseTitles: [],
-      phases: [],
-    };
+    const planResult: PlanResult | null =
+      resumeFrom === "plan"
+        ? null
+        : {
+            branch: row.branch_name,
+            worktreePath: row.worktree_path,
+            planPath: row.plan_path!,
+            headSha: row.head_sha ?? "",
+            phaseTitles: [],
+            phases: [],
+          };
     this.inFlightIssueId = issue.id;
     this.inFlightPipeline = this.continuePipeline(issue, planResult, resumeFrom)
       .finally(() => {
@@ -583,8 +652,8 @@ export class Orchestrator {
   /** Used by restart recovery to skip already-completed stages. */
   private async continuePipeline(
     issue: PlaneIssue,
-    planResult: PlanResult,
-    resumeFrom: "build" | "e2e",
+    planResult: PlanResult | null,
+    resumeFrom: "plan" | "build" | "review" | "e2e",
   ): Promise<void> {
     await this.pipelineLoop(issue, planResult, resumeFrom);
   }
@@ -625,6 +694,7 @@ export class Orchestrator {
           priorFailures,
         });
         if (out.aborted) {
+          if (this.stopped) return;
           // Reviewer interrupted mid-plan. The watcher already wrote feedback
           // to pending_feedback; the next iteration drains it via
           // foldInPendingFeedback above. Do NOT advance the loop counter —
@@ -648,6 +718,7 @@ export class Orchestrator {
         if (!planResult) return;
         const out = await this.runBuilding(issue, planResult);
         if (out.aborted) {
+          if (this.stopped) return;
           stage = "plan";
           continue;
         }
@@ -670,6 +741,7 @@ export class Orchestrator {
         await this.pushDashboard(issue.id, { statusLabel: "Review", detail: null });
         const out = await this.runReviewStage(issue, planResult, loop);
         if (out.aborted) {
+          if (this.stopped) return;
           stage = "plan";
           continue;
         }
@@ -704,6 +776,7 @@ export class Orchestrator {
           loop,
         );
         if (previewOutcome.aborted) {
+          if (this.stopped) return;
           stage = "plan";
           continue;
         }
@@ -727,6 +800,7 @@ export class Orchestrator {
         });
         const out = await this.runE2e(issue, planResult, previewUrl, loop, priorFailures);
         if (out.aborted) {
+          if (this.stopped) return;
           stage = "plan";
           continue;
         }

@@ -89,7 +89,7 @@ ${description}
    - End with a concrete browser-observable behavior the user can verify.
    - Specify what files / modules are likely to change (best-effort, not binding).
    - Include a **Browser acceptance check** written in natural language that describes the *intent* of what to verify, not exact selectors or strict click-by-click instructions. The Building Agent and E2E Agent should both be able to follow it loosely.
-   - Include a **Satisfies AC** line listing the 1-indexed bullet numbers from the issue's \`## Acceptance Criteria\` section that this phase, once green, demonstrably satisfies. Use \`none\` if the phase doesn't tick any AC (e.g. a refactor-only phase). If the issue has no \`## Acceptance Criteria\` section, use \`none\` for every phase. Do NOT invent AC numbers that don't exist.
+   - Include a **Satisfies AC** line listing the 1-indexed bullet numbers from the issue's \`## Acceptance Criteria\` section that this phase, once green, demonstrably satisfies. If you drafted acceptance criteria in \`${acDraftRelPath || "ac-draft.md"}\`, use those drafted bullet numbers. Use \`none\` only if the phase doesn't tick any AC (e.g. a refactor-only phase). Do NOT invent AC numbers that don't exist in either the issue body or your draft.
 
 # Output
 
@@ -143,6 +143,7 @@ Then stop. The orchestrator polls for that flag file and will close this session
 
 - No code changes outside of the \`.agent/issues/${input.workItemId}/\` directory.
 - No long shell commands; \`ctx7\` is OK.
-- If the issue is too ambiguous to plan, still produce the best plan you can and list the ambiguities in **Open assumptions** so the Building Agent / human reviewer can resolve them.
+- If the issue has Acceptance Criteria but is still somewhat ambiguous, produce the best plan you can and list the ambiguities in **Open assumptions** so the Building Agent / human reviewer can resolve them.
+- If the issue has no Acceptance Criteria and is too thin to draft concrete criteria, do not produce a plan; write \`${doneFlagRelPath}\` with \`too-vague\`.
 `;
 }

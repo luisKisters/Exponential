@@ -19,6 +19,10 @@
 
 const FENCE_START = "<!-- exponential:plan v1 start -->";
 const FENCE_END = "<!-- exponential:plan v1 end -->";
+const FENCE_WRAPPER_RE =
+  /<div\b[^>]*(?:data-exponential-fence|data-exponential-owned)=["']plan-v1["'][^>]*>[\s\S]*?<\/div>/i;
+const LEGACY_DASHBOARD_RE =
+  /<p><strong>Status:<\/strong>[\s\S]*?<\/p>\s*(?:<p><em>Plan not yet available\.<\/em><\/p>\s*)?(?:<ul>[\s\S]*?<\/ul>\s*)?<p>Full plan:[\s\S]*?<\/p>/i;
 
 // Phase 6.5: provenance markers for an auto-drafted Acceptance Criteria section.
 // The orchestrator injects this block (above the fence) only when the human
@@ -67,7 +71,7 @@ export function injectDashboardFence(
  * untouched.
  */
 function injectFence(currentHtml: string, innerHtml: string): string {
-  const fencedBlock = `${FENCE_START}\n${innerHtml}\n${FENCE_END}`;
+  const fencedBlock = `${FENCE_START}\n<div data-exponential-fence="plan-v1">${innerHtml}</div>\n${FENCE_END}`;
 
   const startIdx = currentHtml.indexOf(FENCE_START);
   const endIdx = currentHtml.indexOf(FENCE_END);
@@ -78,7 +82,11 @@ function injectFence(currentHtml: string, innerHtml: string): string {
     return `${before}${fencedBlock}${after}`;
   }
 
-  const base = currentHtml.trim();
+  if (FENCE_WRAPPER_RE.test(currentHtml)) {
+    return currentHtml.replace(FENCE_WRAPPER_RE, fencedBlock);
+  }
+
+  const base = removeLegacyDashboard(currentHtml).trim();
   if (base.length === 0) {
     return fencedBlock;
   }
@@ -93,11 +101,25 @@ function injectFence(currentHtml: string, innerHtml: string): string {
 export function removeFence(currentHtml: string): string {
   const startIdx = currentHtml.indexOf(FENCE_START);
   const endIdx = currentHtml.indexOf(FENCE_END);
-  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) return currentHtml;
-  let before = currentHtml.slice(0, startIdx);
-  const after = currentHtml.slice(endIdx + FENCE_END.length);
-  if (before.endsWith("\n")) before = before.slice(0, -1);
-  return `${before}${after}`;
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    let before = currentHtml.slice(0, startIdx);
+    const after = currentHtml.slice(endIdx + FENCE_END.length);
+    if (before.endsWith("\n")) before = before.slice(0, -1);
+    return `${before}${after}`;
+  }
+  if (FENCE_WRAPPER_RE.test(currentHtml)) {
+    return currentHtml.replace(FENCE_WRAPPER_RE, "");
+  }
+  return removeLegacyDashboard(currentHtml);
+}
+
+function removeLegacyDashboard(currentHtml: string): string {
+  if (!LEGACY_DASHBOARD_RE.test(currentHtml)) return currentHtml;
+  return currentHtml
+    .replace(LEGACY_DASHBOARD_RE, "")
+    .replace(/<p>\s*<\/p>/gi, "")
+    .replace(/<div>\s*<\/div>/gi, "")
+    .trim();
 }
 
 /**

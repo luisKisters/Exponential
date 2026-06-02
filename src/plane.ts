@@ -5,6 +5,7 @@ import type {
   WorkItemBase,
 } from "@makeplane/plane-node-sdk";
 import type { Logger } from "./logger.js";
+import { removeFence } from "./planeDescription.js";
 
 export type Priority = PriorityEnum;
 
@@ -113,15 +114,19 @@ export class PlaneApi {
       workItemId,
     );
     const descriptionHtml = item.description_html ?? "";
+    const agentVisibleHtml = removeFence(descriptionHtml);
     // Plane's API only populates `description_stripped` when an issue is
     // edited through the TipTap UI — issues created or updated via the REST
     // API leave the field entirely missing. Fall back to stripping the HTML
     // ourselves so downstream agents (Planning, Building, E2E) always have a
-    // readable description to work with.
+    // readable description to work with. Always strip our managed dashboard
+    // fence first; agents should see the human ask + ACs, not Exponential's
+    // live status block.
     const descriptionTextRaw = item.description_stripped ?? "";
-    const descriptionText = descriptionTextRaw.trim().length > 0
-      ? descriptionTextRaw
-      : stripHtmlToText(descriptionHtml);
+    const htmlText = stripHtmlToText(agentVisibleHtml);
+    const descriptionText = descriptionHtml.trim().length > 0
+      ? htmlText
+      : descriptionTextRaw;
     return {
       ...toPlaneIssue(item),
       descriptionHtml,

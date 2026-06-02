@@ -2,10 +2,11 @@
 
 Autonomous agent orchestrator that turns Plane issues into shipped code.
 
-This repository implements **Phase 1 (Orchestrator Core)** and **Phase 2
-(Planning Agent)** of the PRD — polling Plane, picking up "In Progress" issues,
-and spawning a Claude Code planning agent that writes a phased implementation
-plan onto a feature branch of the summario repo.
+This repository implements the full PRD pipeline — polling Plane, picking up
+"In Progress" issues, then driving Claude Code through plan → multi-session
+build → code review → E2E against a Vercel preview, with a comment-driven
+revise loop and restart recovery throughout. Phase 8 packages it for
+deployment to a server via Coolify.
 
 See [`exponential-prd.md`](./exponential-prd.md) for the full plan.
 
@@ -15,9 +16,14 @@ See [`exponential-prd.md`](./exponential-prd.md) for the full plan.
 |---|---|
 | 1. Orchestrator Core | ✅ |
 | 2. Planning Agent | ✅ |
-| 3. Building Agent | ⏳ |
-| 4. E2E Agent + Full Pipeline | ⏳ |
-| 5. Deployment | ⏳ |
+| 3. Building Agent | ✅ |
+| 4. E2E Agent + Full Pipeline | ✅ |
+| 4.5 Comment-driven revise loop | ✅ |
+| 5. Operational hardening | ✅ |
+| 6. Multi-session builder | ✅ |
+| 6.5 Live dashboard fence | ✅ |
+| 7. Review pass | ✅ |
+| 8. Deployment (Docker / Coolify) | ✅ |
 
 ## Requirements
 
@@ -76,6 +82,14 @@ directly with the env injected another way (`direnv`, container env, etc.).
 | `POLL_INTERVAL_MS` | no | `30000` | Poll interval. |
 | `DATABASE_PATH` | no | `./data/exponential.sqlite` | SQLite file path. |
 | `LOG_LEVEL` | no | `info` | `trace` / `debug` / `info` / `warn` / `error`. |
+| `HEALTH_PORT` | no | `8080` | HTTP health endpoint port (`0` disables it). |
+| `HEALTH_HOST` | no | `0.0.0.0` | Health endpoint bind address. |
+| `GITHUB_TOKEN` | in Docker | — | Token for the `gh` CLI + git push. |
+| `VERCEL_TOKEN` | in Docker | — | Vercel CLI token (no keyring in a container). |
+
+This table covers the core + Phase 8 vars; see [`.env.example`](./.env.example)
+for the complete, commented list (build/E2E/review timeouts, dev-server policy,
+mock test user, comment-poll cadence, etc.).
 
 ## Phase 1 acceptance test
 
@@ -171,21 +185,80 @@ On every poll the orchestrator:
    `none`) and breaks ties by `updated_at` ascending (oldest first ≈ FIFO).
 5. Records the winner with `status = 'picked_up'` and posts the pickup comment.
 
-## Docker
+## Deployment (Phase 8)
 
-A `Dockerfile` is included for Phase 5; it builds the TypeScript and runs
-`node dist/index.js`. The SQLite file lives at `/app/data/exponential.sqlite`
-which is exposed as a volume. The image does **not** ship the Claude Code CLI
-or the summario clone — for Phase 5 both will be mounted in (`/usr/local/bin/claude`
-and `/workspaces/summario`).
+The `Dockerfile` ships everything the orchestrator shells out to — the Claude
+Code CLI, `git` + `openssh-client`, the GitHub CLI (`gh`), `pnpm`, and `npx`
+(for `vercel`). Native deps (`better-sqlite3`, `node-pty`) are compiled in a
+throwaway toolchain stage; the runtime image is slim and carries only the built
+artifacts. `docker-compose.yml` is the Coolify deployment unit.
+
+### Health endpoint
+
+The process serves `GET /healthz` (default `:8080`) — `200` while the poll loop
+is alive, `503` once it goes stale or stops. Both the Docker `HEALTHCHECK` and
+the compose health check poll it; set `HEALTH_PORT=0` to disable.
 
 ```bash
+curl -fsS localhost:8080/healthz | jq
+# {"status":"ok","startedAt":"…","uptimeSeconds":42,"lastCycleAt":"…",
+#  "lastCycleOk":true,"inFlightIssueId":null,"pollIntervalMs":30000}
+```
+
+### Volumes
+
+| Mount | Purpose |
+|---|---|
+| `/app/data` | SQLite DB — in-flight issue state, survives restarts. |
+| `/workspaces` | Git worktrees for in-flight issues (`WORKTREE_BASE_PATH`). |
+| `/app/claude-config` | Claude Code auth/config (`CLAUDE_CONFIG_DIR`). |
+| `/summario` | **Pre-installed** summario clone (`SUMMARIO_REPO_PATH`). |
+| `/root/.ssh` (ro) | Deploy key + `known_hosts` for git push over SSH. |
+
+Two prerequisites the volumes must satisfy before the first real run:
+
+- **`/summario` must be pre-installed.** The builder symlinks
+  `<summario>/.env` and `<summario>/node_modules` into each worktree, so
+  `pnpm install` must already have run in the mounted clone.
+- **`/app/claude-config` must hold a Claude login.** Authenticate once into the
+  volume, e.g. `docker exec -it <container> claude` (or seed the volume from a
+  workstation login). Automated sessions run with
+  `--permission-mode bypassPermissions` (set via `CLAUDE_EXTRA_ARGS`).
+
+### Coolify
+
+1. New service → **Docker Compose**, pointed at this repo.
+2. Set the secrets in the Coolify env UI: `PLANE_API_KEY`, `GITHUB_TOKEN`,
+   `VERCEL_TOKEN`, `VERCEL_PROTECTION_BYPASS`, `MOCK_TEST_USER_PASSWORD` — plus
+   the non-secret `PLANE_*`, `SUMMARIO_GITHUB_REPO`, `MOCK_TEST_USER_EMAIL`.
+3. Attach the summario clone + SSH key volumes (see `SUMMARIO_HOST_PATH` /
+   `SSH_DIR_HOST_PATH` in `.env.example`).
+4. Deploy. Coolify's health check tracks `/healthz`; `restart: unless-stopped`
+   handles crash recovery, and the orchestrator resumes any orphaned in-flight
+   issue from SQLite on boot (`resuming orphaned issue`).
+
+```bash
+# local image smoke (Docker required):
 docker build -t exponential .
-docker run --rm \
-  -e PLANE_BASE_URL=... \
-  -e PLANE_API_KEY=... \
-  -e PLANE_WORKSPACE_SLUG=... \
-  -e PLANE_PROJECT_ID=... \
-  -v $(pwd)/data:/app/data \
-  exponential
+docker compose up      # wires the volumes + healthcheck from docker-compose.yml
+```
+
+### GitHub branch protection (summario `main`)
+
+Phase 8 also gates merges to summario behind PR + status checks + a merge
+queue. Run against the **summario** repo (needs admin):
+
+```bash
+gh api -X PUT repos/<owner>/summario/branches/main/protection \
+  --input - <<'JSON'
+{
+  "required_status_checks": { "strict": true, "checks": [
+    { "context": "typecheck" }, { "context": "build" } ] },
+  "required_pull_request_reviews": { "required_approving_review_count": 0 },
+  "enforce_admins": false,
+  "restrictions": null
+}
+JSON
+# Merge queue (squash) is enabled in the repo UI: Settings → General →
+# "Allow merge queue", merge method "Squash".
 ```

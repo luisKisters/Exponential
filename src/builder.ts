@@ -247,8 +247,11 @@ export class Builder {
           prompt,
           doneFlagPath: doneFlagAbs,
           timeoutMs: this.config.builder.phaseTimeoutMs,
+          inactivityNudgeMs: this.config.claude.inactivityNudgeMs,
+          inactivityTimeoutMs: this.config.claude.inactivityTimeoutMs,
           binary: this.config.claude.binary,
           extraArgs: this.config.claude.extraArgs,
+          usePrintMode: this.config.claude.usePrintMode,
           signal,
         });
 
@@ -262,6 +265,8 @@ export class Builder {
           signal: result.signal,
           doneFlagSeen: result.doneFlagSeen,
           timedOut: result.timedOut,
+          inactivityTimedOut: result.inactivityTimedOut,
+          inactivityNudged: result.inactivityNudged,
           aborted: result.aborted,
           verdict,
         });
@@ -556,8 +561,11 @@ export class Builder {
       prompt,
       doneFlagPath: doneFlagAbs,
       timeoutMs: this.config.claude.timeoutMs,
+      inactivityNudgeMs: this.config.claude.inactivityNudgeMs,
+      inactivityTimeoutMs: this.config.claude.inactivityTimeoutMs,
       binary: this.config.claude.binary,
       extraArgs: this.config.claude.extraArgs,
+      usePrintMode: this.config.claude.usePrintMode,
       signal,
     });
 
@@ -567,6 +575,8 @@ export class Builder {
       signal: result.signal,
       doneFlagSeen: result.doneFlagSeen,
       timedOut: result.timedOut,
+      inactivityTimedOut: result.inactivityTimedOut,
+      inactivityNudged: result.inactivityNudged,
       aborted: result.aborted,
     });
 

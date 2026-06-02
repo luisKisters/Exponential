@@ -123,8 +123,11 @@ export class Reviewer {
       prompt,
       doneFlagPath: doneFlagAbs,
       timeoutMs: this.config.review.timeoutMs,
+      inactivityNudgeMs: this.config.claude.inactivityNudgeMs,
+      inactivityTimeoutMs: this.config.claude.inactivityTimeoutMs,
       binary: this.config.claude.binary,
       extraArgs: this.config.claude.extraArgs,
+      usePrintMode: this.config.claude.usePrintMode,
       signal,
     });
 
@@ -139,6 +142,8 @@ export class Reviewer {
       exitCode: result.exitCode,
       doneFlagSeen: result.doneFlagSeen,
       timedOut: result.timedOut,
+      inactivityTimedOut: result.inactivityTimedOut,
+      inactivityNudged: result.inactivityNudged,
       aborted: result.aborted,
       verdict,
       findingsCount,
@@ -235,8 +240,11 @@ export class Reviewer {
       prompt,
       doneFlagPath: doneFlagAbs,
       timeoutMs: this.config.claude.timeoutMs,
+      inactivityNudgeMs: this.config.claude.inactivityNudgeMs,
+      inactivityTimeoutMs: this.config.claude.inactivityTimeoutMs,
       binary: this.config.claude.binary,
       extraArgs: this.config.claude.extraArgs,
+      usePrintMode: this.config.claude.usePrintMode,
       signal,
     });
 
@@ -248,6 +256,8 @@ export class Reviewer {
       exitCode: result.exitCode,
       doneFlagSeen: result.doneFlagSeen,
       timedOut: result.timedOut,
+      inactivityTimedOut: result.inactivityTimedOut,
+      inactivityNudged: result.inactivityNudged,
       aborted: result.aborted,
       verdict,
     });

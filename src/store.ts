@@ -146,19 +146,39 @@ export class Store {
   }
 
   /**
-   * Find an issue whose row was left in a resumable state (`planned` or
-   * `built`) — typically because the orchestrator crashed/restarted between
-   * stages. Returns the next stage to resume from.
+   * Find an issue whose row was left in a recoverable non-terminal state,
+   * typically because the orchestrator crashed/restarted between stages.
+   * Returns the stage to re-enter. Re-running a stage is preferable to leaving
+   * an active row that permanently blocks the single-issue queue.
    */
-  findResumableIssue(): { row: IssueRow; resumeFrom: "build" | "e2e" } | undefined {
+  findResumableIssue():
+    | { row: IssueRow; resumeFrom: "plan" | "build" | "review" | "e2e" }
+    | undefined {
+    const planning = this.db.prepare(
+      `SELECT * FROM issues
+        WHERE status IN ('picked_up', 'planning')
+        ORDER BY updated_at ASC
+        LIMIT 1`,
+    ).get() as IssueRow | undefined;
+    if (planning) return { row: planning, resumeFrom: "plan" };
+
     const planned = this.db.prepare(
-      `SELECT * FROM issues WHERE status = 'planned' LIMIT 1`,
+      `SELECT * FROM issues
+        WHERE status IN ('planned', 'building')
+        ORDER BY updated_at ASC
+        LIMIT 1`,
     ).get() as IssueRow | undefined;
     if (planned) return { row: planned, resumeFrom: "build" };
+
     const built = this.db.prepare(
-      `SELECT * FROM issues WHERE status = 'built' LIMIT 1`,
+      `SELECT * FROM issues WHERE status = 'built' ORDER BY updated_at ASC LIMIT 1`,
     ).get() as IssueRow | undefined;
-    if (built) return { row: built, resumeFrom: "e2e" };
+    if (built) return { row: built, resumeFrom: "review" };
+
+    const e2e = this.db.prepare(
+      `SELECT * FROM issues WHERE status = 'e2e_testing' ORDER BY updated_at ASC LIMIT 1`,
+    ).get() as IssueRow | undefined;
+    if (e2e) return { row: e2e, resumeFrom: "e2e" };
     return undefined;
   }
 

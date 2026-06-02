@@ -510,6 +510,51 @@ Deploy the orchestrator to the server via Coolify.
 - Server resource usage stays within bounds (check `docker stats`)
 - Orchestrator survives a restart (picks up where it left off or re-evaluates queue)
 
+**Shipped:**
+
+The deployable artifacts and the one piece of missing runtime surface (a health
+endpoint) ship in this repo; the *acts* that need the live server + admin
+credentials (the Coolify deploy itself, applying branch protection to summario)
+are documented as runbooks in `README.md` for the operator to execute.
+
+- **Health endpoint.** New `src/health.ts` serves `GET /healthz` (also `/`,
+  `/health`) via `node:http` — 200 while the poll loop is alive or still
+  booting, 503 once stale/stopped. `Orchestrator.getHealth()` reports the
+  liveness snapshot (`status`, `startedAt`, `uptimeSeconds`, `lastCycleAt`,
+  `lastCycleOk`, `inFlightIssueId`); "stale" trips when no poll cycle has
+  finished within `max(3 × pollInterval, 90s)`. Wired into `index.ts` (started
+  after `orchestrator.start()`, closed first on shutdown). New config
+  `health.port` (`HEALTH_PORT`, default 8080, `0` disables) / `health.host`
+  (`HEALTH_HOST`).
+- **Dockerfile.** Rewritten multi-stage: a `base` carrying every binary the
+  orchestrator shells out to (`claude` via `@anthropic-ai/claude-code`, `gh`
+  from GitHub's apt repo, `git`/`openssh-client`/`sqlite3`, `pnpm@9`), a
+  throwaway `toolchain`/`deps` path that compiles the native modules
+  (`better-sqlite3`, `node-pty`) and runs `tsc`, and a slim `runtime` that
+  copies only prod `node_modules` + `dist`. Fixes the prior bug where a global
+  `NODE_ENV=production` made `pnpm install` skip `tsc` and break the build. Adds
+  `HEALTHCHECK`, `EXPOSE 8080`, the three named-volume mountpoints, and
+  container-path env defaults (`SUMMARIO_REPO_PATH=/summario`,
+  `WORKTREE_BASE_PATH=/workspaces`, `CLAUDE_CONFIG_DIR=/app/claude-config`).
+- **`docker-compose.yml`.** Coolify deployment unit: build, `restart:
+  unless-stopped`, the five named/bind volumes (data, workspaces, claude-config,
+  pre-installed summario clone, ro SSH dir), a compose-level health check, and
+  `deploy.resources` limits (2 CPU / 4G).
+- **Restart recovery** was already in place from earlier phases
+  (`resumeOrphans` + `store.findResumableIssue`) — it resolves PRD open
+  question #3 and the "survives a restart" acceptance criterion.
+- **Docs.** `.env.example` gains `HEALTH_PORT`/`HEALTH_HOST` + a Phase 8 block
+  (`GITHUB_TOKEN`, `VERCEL_TOKEN`, container/host path notes). `README.md` gets
+  a Deployment section (health endpoint, volumes table + prerequisites, Coolify
+  steps, branch-protection runbook) and a corrected phase status table.
+- **Not done here (operator-side, needs live infra/admin):** the actual Coolify
+  deploy, and running the `gh api … /branches/main/protection` call against
+  summario. Both are spelled out in `README.md`.
+
+> The image build was **not** verified in this environment (no Docker daemon
+> available); the TypeScript build, the health-server behavior (200/503/404
+> routing), and the config wiring were verified locally.
+
 ---
 
 ## Verification surface

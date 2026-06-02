@@ -1,4 +1,5 @@
 import { loadConfig } from "./config.js";
+import { startHealthServer, type HealthServerHandle } from "./health.js";
 import { createLogger } from "./logger.js";
 import { Orchestrator } from "./orchestrator.js";
 import { PlaneApi } from "./plane.js";
@@ -27,12 +28,20 @@ async function main(): Promise<void> {
     config.plane.apiKey,
   );
   const orchestrator = new Orchestrator(logger, config, plane, store);
+  let healthServer: HealthServerHandle | null = null;
 
   let shuttingDown = false;
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, "received shutdown signal");
+    if (healthServer) {
+      try {
+        await healthServer.close();
+      } catch (err) {
+        logger.error({ err }, "error closing health server");
+      }
+    }
     try {
       await orchestrator.stop();
     } catch (err) {
@@ -59,6 +68,17 @@ async function main(): Promise<void> {
   });
 
   await orchestrator.start();
+
+  if (config.health.port > 0) {
+    healthServer = await startHealthServer(
+      logger,
+      config.health.host,
+      config.health.port,
+      () => orchestrator.getHealth(),
+    );
+  } else {
+    logger.info("health server disabled (HEALTH_PORT=0)");
+  }
 }
 
 main().catch((err) => {

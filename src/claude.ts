@@ -11,10 +11,16 @@ export interface ClaudeSessionOptions {
   doneFlagPath: string;
   /** Hard wall-clock cap on the session, in milliseconds. */
   timeoutMs: number;
+  /** After this much quiet time, type a short continue prompt into the TUI. 0 disables. */
+  inactivityNudgeMs?: number;
+  /** After this much quiet time, force the session down as timed out. 0 disables. */
+  inactivityTimeoutMs?: number;
   /** Path to the claude binary. Default "claude". */
   binary?: string;
   /** Extra args appended after the binary. */
   extraArgs?: string[];
+  /** Run `claude -p` instead of the interactive TUI. */
+  usePrintMode?: boolean;
   /** Extra env merged into process.env when spawning. */
   env?: NodeJS.ProcessEnv;
   /**
@@ -34,6 +40,10 @@ export interface ClaudeSessionResult {
   doneFlagSeen: boolean;
   /** True if the session was force-killed because of the timeout. */
   timedOut: boolean;
+  /** True if the timeout was caused by output inactivity rather than wall-clock duration. */
+  inactivityTimedOut: boolean;
+  /** True if the session received an automatic continue nudge. */
+  inactivityNudged: boolean;
   /** True if the session was interrupted via the abort signal. */
   aborted: boolean;
 }
@@ -53,8 +63,11 @@ export class ClaudeSession {
       prompt,
       doneFlagPath,
       timeoutMs,
+      inactivityNudgeMs = 5 * 60_000,
+      inactivityTimeoutMs = 8 * 60_000,
       binary = "claude",
       extraArgs = [],
+      usePrintMode = true,
       env,
       signal,
     } = options;
@@ -71,7 +84,10 @@ export class ClaudeSession {
       ? extraArgs
       : ["--permission-mode", "bypassPermissions", ...extraArgs];
 
-    const args = [...defaultedArgs, prompt];
+    const hasExplicitPrintMode = extraArgs.some((a) => a === "-p" || a === "--print");
+    const args = usePrintMode || hasExplicitPrintMode
+      ? [...defaultedArgs, ...(hasExplicitPrintMode ? [] : ["-p"]), prompt]
+      : [...defaultedArgs, prompt];
 
     this.logger.info(
       {
@@ -80,6 +96,9 @@ export class ClaudeSession {
         extraArgs,
         doneFlagPath,
         timeoutMs,
+        inactivityNudgeMs,
+        inactivityTimeoutMs,
+        usePrintMode: usePrintMode || hasExplicitPrintMode,
       },
       "spawning claude session",
     );
@@ -95,21 +114,41 @@ export class ClaudeSession {
       },
     });
 
+    // Recent Claude Code builds can open the interactive TUI with the
+    // positional prompt pre-filled but not submitted. Press Enter once after
+    // startup so unattended interactive sessions actually begin. If the prompt
+    // was already submitted, this is just an empty line.
+    const initialSubmitTimer = setTimeout(() => {
+      if (usePrintMode || hasExplicitPrintMode) return;
+      try {
+        child.write("\r");
+      } catch (err) {
+        this.logger.warn({ err }, "failed to submit initial claude prompt");
+      }
+    }, 750);
+
     const state: {
       transcript: string;
       doneFlagSeen: boolean;
       timedOut: boolean;
+      inactivityTimedOut: boolean;
+      inactivityNudged: boolean;
       aborted: boolean;
       exit: { code: number | null; signal: number | null } | null;
     } = {
       transcript: "",
       doneFlagSeen: false,
       timedOut: false,
+      inactivityTimedOut: false,
+      inactivityNudged: false,
       aborted: false,
       exit: null,
     };
 
+    let lastOutputAt = Date.now();
+
     child.onData((data) => {
+      if (data.length > 0) lastOutputAt = Date.now();
       state.transcript += data;
       // Trim the transcript to a sane upper bound so we don't OOM on a chatty
       // session.
@@ -149,6 +188,33 @@ export class ClaudeSession {
           resolveFlag();
           return;
         }
+        const idleMs = Date.now() - lastOutputAt;
+        if (
+          inactivityNudgeMs > 0 &&
+          idleMs > inactivityNudgeMs &&
+          !state.inactivityNudged &&
+          !usePrintMode &&
+          !hasExplicitPrintMode
+        ) {
+          state.inactivityNudged = true;
+          this.logger.warn(
+            { idleMs, inactivityNudgeMs },
+            "claude session inactive; sending continue nudge",
+          );
+          try {
+            child.write(
+              "\rPlease continue. If you are blocked, write the required progress file and done.flag verdict now.\r",
+            );
+          } catch (err) {
+            this.logger.warn({ err }, "failed to send inactivity nudge to claude pty");
+          }
+        }
+        if (inactivityTimeoutMs > 0 && idleMs > inactivityTimeoutMs) {
+          state.timedOut = true;
+          state.inactivityTimedOut = true;
+          resolveFlag();
+          return;
+        }
         if (Date.now() - startTime > timeoutMs) {
           state.timedOut = true;
           resolveFlag();
@@ -185,6 +251,8 @@ export class ClaudeSession {
         transcript: state.transcript,
         doneFlagSeen: state.doneFlagSeen,
         timedOut: false,
+        inactivityTimedOut: state.inactivityTimedOut,
+        inactivityNudged: state.inactivityNudged,
         aborted: state.aborted,
       };
     }
@@ -204,14 +272,24 @@ export class ClaudeSession {
         "claude session aborted by orchestrator (reviewer feedback)",
       );
       try {
-        child.write("/exit\r");
+        if (usePrintMode || hasExplicitPrintMode) {
+          child.kill("SIGTERM");
+        } else {
+          child.write("/exit\r");
+        }
       } catch (err) {
-        this.logger.warn({ err }, "failed to send /exit to claude pty during abort");
+        this.logger.warn({ err }, "failed to stop claude session during abort");
       }
     } else if (state.timedOut) {
       this.logger.error(
-        { timeoutMs },
-        "claude session timed out before done flag",
+        {
+          timeoutMs,
+          inactivityTimeoutMs,
+          inactivityTimedOut: state.inactivityTimedOut,
+        },
+        state.inactivityTimedOut
+          ? "claude session inactive too long before done flag"
+          : "claude session timed out before done flag",
       );
     }
 
@@ -241,6 +319,7 @@ export class ClaudeSession {
     );
 
     await exitPromise;
+    clearTimeout(initialSubmitTimer);
     clearTimeout(exitTimer);
     clearTimeout(hardKillTimer);
 
@@ -251,6 +330,8 @@ export class ClaudeSession {
       transcript: state.transcript,
       doneFlagSeen: state.doneFlagSeen,
       timedOut: state.timedOut,
+      inactivityTimedOut: state.inactivityTimedOut,
+      inactivityNudged: state.inactivityNudged,
       aborted: state.aborted,
     };
   }

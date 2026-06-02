@@ -141,8 +141,11 @@ export class Planner {
       prompt,
       doneFlagPath: doneFlagAbsPath,
       timeoutMs: this.config.claude.timeoutMs,
+      inactivityNudgeMs: this.config.claude.inactivityNudgeMs,
+      inactivityTimeoutMs: this.config.claude.inactivityTimeoutMs,
       binary: this.config.claude.binary,
       extraArgs: this.config.claude.extraArgs,
+      usePrintMode: this.config.claude.usePrintMode,
       signal: opts.signal,
     });
 
@@ -151,6 +154,8 @@ export class Planner {
       signal: result.signal,
       doneFlagSeen: result.doneFlagSeen,
       timedOut: result.timedOut,
+      inactivityTimedOut: result.inactivityTimedOut,
+      inactivityNudged: result.inactivityNudged,
       aborted: result.aborted,
     });
 
@@ -401,4 +406,3 @@ function buildPlanCommentHtml(input: {
 <p>Branch: <code>${escapeHtml(input.branch)}</code><br>Plan: <code>${escapeHtml(input.planRelPath)}</code><br>Commit: <code>${escapeHtml(input.headSha.slice(0, 12))}</code></p>
 <ol>${items}</ol>`;
 }
-
