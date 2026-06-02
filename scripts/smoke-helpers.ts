@@ -9,7 +9,9 @@
  * Run with: pnpm tsx scripts/smoke-helpers.ts
  */
 import { parsePhaseOutcomes, type PhaseOutcome } from "../src/builder.ts";
+import { renderDashboardHtml, type DashboardModel } from "../src/dashboard.ts";
 import { parseVerdict } from "../src/e2e.ts";
+import { buildBlobUrl, buildPrBody } from "../src/github.ts";
 import { formatPhaseSection } from "../src/memory.ts";
 import { extractPhaseTitles, parseAcList, parsePlanPhases } from "../src/plan.ts";
 import {
@@ -309,6 +311,69 @@ console.log("\n== formatPhaseSection (round-trips through parsePhaseOutcomes) ==
   );
   check("empty AC renders as 'none'", none.includes("- Satisfies AC: none"));
   check("empty notes renders as '(none)'", none.includes("- Notes: (none)"));
+}
+
+console.log("\n== github.buildBlobUrl / buildPrBody ==");
+{
+  const url = buildBlobUrl(
+    "luiskisters/summario",
+    "agent/PLANE-42-add-thing",
+    ".agent/issues/abc-123/plan.md",
+  );
+  check(
+    "blob url targets the branch + in-repo plan path",
+    url ===
+      "https://github.com/luiskisters/summario/blob/agent/PLANE-42-add-thing/.agent/issues/abc-123/plan.md",
+    url,
+  );
+  check(
+    "blob url keeps branch slashes unescaped",
+    url.includes("/blob/agent/PLANE-42-add-thing/"),
+  );
+
+  const body = buildPrBody({
+    shortId: "PLANE-42",
+    issueTitle: "Add the thing",
+    planUrl: "https://github.com/luiskisters/summario/blob/b/p.md",
+    phaseTitles: ["Scaffold", "Wire up"],
+  });
+  check("pr body links the Plane issue", body.includes("**Plane issue:** PLANE-42 — Add the thing"));
+  check("pr body links the plan", body.includes("(https://github.com/luiskisters/summario/blob/b/p.md)"));
+  check("pr body lists phases as a task list", body.includes("- [ ] Phase 1 — Scaffold") && body.includes("- [ ] Phase 2 — Wire up"));
+  check("pr body notes it was auto-opened", body.toLowerCase().includes("exponential"));
+
+  const noPlan = buildPrBody({ shortId: "PLANE-1", issueTitle: "x", planUrl: null, phaseTitles: [] });
+  check("pr body without a plan omits the plan line", !noPlan.includes("**Plan:**"));
+  check("pr body without phases says so", noPlan.includes("_No phases parsed from the plan._"));
+}
+
+console.log("\n== dashboard.renderDashboardHtml (links line) ==");
+{
+  const base: DashboardModel = {
+    shortId: "PLANE-42",
+    statusLabel: "E2E",
+    detail: "verifying preview",
+    branch: "agent/PLANE-42-add-thing",
+    phases: [
+      { index: 1, title: "Scaffold", satisfiesAc: [1], state: "done" },
+      { index: 2, title: "Wire up", satisfiesAc: [2, 3], state: "active" },
+    ],
+    planRelPath: ".agent/issues/abc/plan.md",
+    planUrl: "https://github.com/o/r/blob/b/plan.md",
+    prUrl: "https://github.com/o/r/pull/7",
+    previewUrl: "https://preview.example.com",
+    updatedAtUtc: "14:02 UTC",
+  };
+  const html = renderDashboardHtml(base);
+  check("dashboard keeps the phase checklist with AC labels", html.includes("Phase 1 — Scaffold (AC 1)") && html.includes("Phase 2 — Wire up (AC 2, 3)"));
+  check("dashboard links the PR", html.includes('<a href="https://github.com/o/r/pull/7">PR</a>'));
+  check("dashboard links the plan", html.includes('<a href="https://github.com/o/r/blob/b/plan.md">Plan</a>'));
+  check("dashboard links the preview", html.includes('<a href="https://preview.example.com">https://preview.example.com</a>'));
+
+  const early = renderDashboardHtml({ ...base, prUrl: null, planUrl: null, previewUrl: null });
+  check("dashboard before PR omits the PR link", !early.includes(">PR</a>"));
+  check("dashboard before push falls back to the plan path", early.includes("Plan (<code>.agent/issues/abc/plan.md</code>)"));
+  check("dashboard before preview shows pending", early.includes("Preview: <em>pending</em>"));
 }
 
 console.log("");

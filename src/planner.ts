@@ -4,6 +4,7 @@ import { join, relative } from "node:path";
 import { ClaudeSession } from "./claude.js";
 import type { Config } from "./config.js";
 import { buildBranchName, buildWorktreePath, Git } from "./git.js";
+import { buildBlobUrl, buildPrBody, ensurePullRequest } from "./github.js";
 import type { Logger } from "./logger.js";
 import { parsePlanPhases, type ParsedPhase } from "./plan.js";
 import {
@@ -21,6 +22,8 @@ export interface PlanOptions {
   priorFailures?: string;
   /** Optional abort signal for reviewer-feedback interruption. */
   signal?: AbortSignal;
+  /** owner/repo for opening the PR + building the plan link. Undefined = skip. */
+  ghRepo?: string | undefined;
 }
 
 export interface PlanResult {
@@ -32,6 +35,10 @@ export interface PlanResult {
   phases: ParsedPhase[];
   /** Sha that was pushed to the remote. */
   headSha: string;
+  /** URL of the opened GitHub PR (null when ghRepo unknown or gh failed). */
+  prUrl: string | null;
+  /** GitHub blob URL to the full plan on the branch (null when ghRepo unknown). */
+  planUrl: string | null;
 }
 
 export class Planner {
@@ -237,6 +244,38 @@ export class Planner {
       phases: phaseTitles.length,
     });
 
+    // Always open (or re-find) a PR for the freshly-pushed branch and link it.
+    // Best-effort: ghRepo unknown or a `gh` failure leaves prUrl/planUrl null —
+    // the pipeline carries on, the dashboard just shows fewer links.
+    let prUrl: string | null = null;
+    let planUrl: string | null = null;
+    if (opts.ghRepo) {
+      // planRelPath is the in-repo path (.agent/issues/<id>/plan.md); planPathRecord
+      // is repo→worktree-file relative (for builder fs reads), unusable as a URL.
+      planUrl = buildBlobUrl(opts.ghRepo, branch, planRelPath);
+      prUrl = await ensurePullRequest(this.logger, {
+        ghRepo: opts.ghRepo,
+        branch,
+        baseBranch: this.config.summario.defaultBranch,
+        title: `${shortId}: ${issue.name}`,
+        body: buildPrBody({
+          shortId,
+          issueTitle: issue.name,
+          planUrl,
+          phaseTitles,
+        }),
+      });
+      if (prUrl) {
+        this.store.setPrUrl(issue.id, prUrl);
+        this.store.recordEvent(issue.id, "pr_opened", { prUrl, branch });
+      }
+    } else {
+      this.logger.warn(
+        { workItemId: issue.id },
+        "github repo unresolved; skipping PR creation + plan link",
+      );
+    }
+
     // Phase 6.5: if the issue had no human AC and the agent drafted some,
     // inject them above the fence (with a provenance sentinel). The orchestrator
     // owns the dashboard fence itself, so the planner no longer dumps the plan
@@ -275,7 +314,9 @@ export class Planner {
       buildPlanCommentHtml({
         branch,
         phaseTitles,
-        planRelPath: planPathRecord,
+        planRelPath,
+        planUrl,
+        prUrl,
         headSha,
         loopNumber: opts.loopNumber ?? 1,
       }),
@@ -289,6 +330,8 @@ export class Planner {
       phaseTitles,
       phases,
       headSha,
+      prUrl,
+      planUrl,
     };
   }
 }
@@ -393,6 +436,8 @@ function buildPlanCommentHtml(input: {
   branch: string;
   phaseTitles: string[];
   planRelPath: string;
+  planUrl: string | null;
+  prUrl: string | null;
   headSha: string;
   loopNumber: number;
 }): string {
@@ -402,7 +447,13 @@ function buildPlanCommentHtml(input: {
   const heading = input.loopNumber > 1
     ? `<p><strong>Planning revised (loop ${input.loopNumber}).</strong></p>`
     : `<p><strong>Planning complete.</strong></p>`;
+  const planCell = input.planUrl
+    ? `<a href="${escapeHtml(input.planUrl)}">${escapeHtml(input.planRelPath)}</a>`
+    : `<code>${escapeHtml(input.planRelPath)}</code>`;
+  const prLine = input.prUrl
+    ? `<p>PR: <a href="${escapeHtml(input.prUrl)}">${escapeHtml(input.prUrl)}</a></p>`
+    : "";
   return `${heading}
-<p>Branch: <code>${escapeHtml(input.branch)}</code><br>Plan: <code>${escapeHtml(input.planRelPath)}</code><br>Commit: <code>${escapeHtml(input.headSha.slice(0, 12))}</code></p>
-<ol>${items}</ol>`;
+<p>Branch: <code>${escapeHtml(input.branch)}</code><br>Plan: ${planCell}<br>Commit: <code>${escapeHtml(input.headSha.slice(0, 12))}</code></p>
+${prLine}<ol>${items}</ol>`;
 }

@@ -29,8 +29,14 @@ export interface DashboardModel {
   detail: string | null;
   branch: string;
   phases: DashboardPhase[];
-  /** Repo-relative path to the full plan on the branch. */
+  /** Repo-relative path to the full plan on the branch (link fallback text). */
   planRelPath: string;
+  /** GitHub blob URL to the full plan on the branch (null until pushed). */
+  planUrl: string | null;
+  /** GitHub PR URL for the branch (null until the PR is opened). */
+  prUrl: string | null;
+  /** Vercel preview URL (null until a preview deploy succeeds). */
+  previewUrl: string | null;
   /** Pre-formatted "HH:MM UTC" timestamp (the caller owns the clock). */
   updatedAtUtc: string;
 }
@@ -88,9 +94,30 @@ export function renderDashboardHtml(model: DashboardModel): string {
     phasesBlock = `<p><strong>Phases</strong></p><ul>${rows}</ul>`;
   }
 
-  const planLine = `<p>Full plan: <code>${escapeHtml(model.planRelPath)}</code> on branch <code>${escapeHtml(model.branch)}</code>.</p>`;
+  return `${statusLine}${phasesBlock}${renderLinks(model)}`;
+}
 
-  return `${statusLine}${phasesBlock}${planLine}`;
+/**
+ * Render the "Links:" line — PR · Plan · Preview. Each is a real anchor when
+ * its URL is known; the plan falls back to its repo-relative path before the
+ * branch is pushed, and the preview shows "pending" until E2E gets a deploy.
+ */
+function renderLinks(model: DashboardModel): string {
+  const parts: string[] = [];
+  if (model.prUrl) {
+    parts.push(`<a href="${escapeHtml(model.prUrl)}">PR</a>`);
+  }
+  parts.push(
+    model.planUrl
+      ? `<a href="${escapeHtml(model.planUrl)}">Plan</a>`
+      : `Plan (<code>${escapeHtml(model.planRelPath)}</code>)`,
+  );
+  parts.push(
+    model.previewUrl
+      ? `Preview: <a href="${escapeHtml(model.previewUrl)}">${escapeHtml(model.previewUrl)}</a>`
+      : "Preview: <em>pending</em>",
+  );
+  return `<p><strong>Links:</strong> ${parts.join(" · ")}</p>`;
 }
 
 function escapeHtml(input: string): string {

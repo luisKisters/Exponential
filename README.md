@@ -8,6 +8,12 @@ build → code review → E2E against a Vercel preview, with a comment-driven
 revise loop and restart recovery throughout. Phase 8 packages it for
 deployment to a server via Coolify.
 
+Each picked-up issue gets its own `agent/PLANE-<n>-<slug>` branch and an
+auto-opened GitHub PR (against `SUMMARIO_DEFAULT_BRANCH`). The Plane issue
+description carries a live, concise phase + acceptance-criteria checklist, and
+the PR, the full plan, and the Vercel preview are linked from both the
+description fence and the pipeline comments.
+
 See [`exponential-prd.md`](./exponential-prd.md) for the full plan.
 
 ## Status
@@ -84,7 +90,7 @@ directly with the env injected another way (`direnv`, container env, etc.).
 | `LOG_LEVEL` | no | `info` | `trace` / `debug` / `info` / `warn` / `error`. |
 | `HEALTH_PORT` | no | `8080` | HTTP health endpoint port (`0` disables it). |
 | `HEALTH_HOST` | no | `0.0.0.0` | Health endpoint bind address. |
-| `GITHUB_TOKEN` | in Docker | — | Token for the `gh` CLI + git push. |
+| `GITHUB_TOKEN` | in Docker | — | Token for the `gh` CLI (deployments + PR open) + git push. Needs pull-request write scope. |
 | `VERCEL_TOKEN` | in Docker | — | Vercel CLI token (no keyring in a container). |
 
 This table covers the core + Phase 8 vars; see [`.env.example`](./.env.example)

@@ -48,6 +48,8 @@ export interface IssueRow {
   pending_feedback: string | null;
   /** How many times we've retried a failed Vercel preview deploy for this issue. */
   preview_fixup_attempt_count: number;
+  /** URL of the GitHub PR opened for this issue's branch (null until opened). */
+  pr_url: string | null;
 }
 
 export interface PickupInsert {
@@ -117,6 +119,8 @@ export class Store {
       "pending_feedback TEXT",
       // Phase 5 (slice 5a) — Vercel preview retriable resource.
       "preview_fixup_attempt_count INTEGER NOT NULL DEFAULT 0",
+      // Auto-opened GitHub PR for the issue branch.
+      "pr_url TEXT",
     ];
     for (const col of extraColumns) {
       try {
@@ -301,6 +305,20 @@ export class Store {
        WHERE plane_work_item_id = ?`,
     );
     stmt.run(planPath, now, workItemId);
+  }
+
+  /**
+   * Record the URL of the GitHub PR opened for this issue's branch. Idempotent:
+   * the planner re-runs `ensurePullRequest` every loop, which returns the same
+   * URL, so this just overwrites with an identical value on revisions.
+   */
+  setPrUrl(workItemId: string, prUrl: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE issues SET pr_url = ?, updated_at = ? WHERE plane_work_item_id = ?`,
+      )
+      .run(prUrl, now, workItemId);
   }
 
   markBuilding(workItemId: string): void {

@@ -10,6 +10,7 @@ import {
 } from "./dashboard.js";
 import { E2eRunner, type E2eResult } from "./e2e.js";
 import { buildBranchName, Git } from "./git.js";
+import { buildBlobUrl } from "./github.js";
 import type { Logger } from "./logger.js";
 import { injectDashboardFence, removeFence } from "./planeDescription.js";
 import { PRIORITY_RANK, type PlaneApi, type PlaneComment, type PlaneIssue } from "./plane.js";
@@ -388,6 +389,14 @@ export class Orchestrator {
             headSha: row.head_sha ?? "",
             phaseTitles: [],
             phases: [],
+            prUrl: row.pr_url ?? null,
+            planUrl: this.ghRepo
+              ? buildBlobUrl(
+                  this.ghRepo,
+                  row.branch_name,
+                  `.agent/issues/${row.plane_work_item_id}/plan.md`,
+                )
+              : null,
           };
     this.inFlightIssueId = issue.id;
     this.inFlightPipeline = this.continuePipeline(issue, planResult, resumeFrom)
@@ -565,13 +574,24 @@ export class Orchestrator {
       satisfiesAc: p.satisfiesAc,
       state: "pending",
     }));
+    // Link sources: a fresh plan carries pr/plan URLs directly; on resume we
+    // recover the PR + preview from the persisted row and rebuild the plan link
+    // from the in-repo path (.agent/issues/<id>/plan.md, committed on the branch).
+    const row = this.store.getIssue(issue.id);
+    const planRelPath = `.agent/issues/${issue.id}/plan.md`;
+    const planUrl =
+      planResult?.planUrl ??
+      (this.ghRepo ? buildBlobUrl(this.ghRepo, branch, planRelPath) : null);
     this.dashboard = {
       shortId: `PLANE-${issue.sequenceId}`,
       statusLabel: "Planning",
       detail: null,
       branch,
       phases,
-      planRelPath: `.agent/issues/${issue.id}/plan.md`,
+      planRelPath,
+      planUrl,
+      prUrl: planResult?.prUrl ?? row?.pr_url ?? null,
+      previewUrl: row?.preview_url ?? null,
       updatedAtUtc: this.nowUtcHm(),
     };
   }
@@ -797,6 +817,7 @@ export class Orchestrator {
         await this.pushDashboard(issue.id, {
           statusLabel: "E2E",
           detail: "verifying preview",
+          previewUrl,
         });
         const out = await this.runE2e(issue, planResult, previewUrl, loop, priorFailures);
         if (out.aborted) {
@@ -889,6 +910,7 @@ export class Orchestrator {
         loopNumber: opts.loopNumber,
         priorFailures: opts.priorFailures,
         signal: stageAbort.signal,
+        ghRepo: this.ghRepo,
       });
       this.logger.info(
         {
@@ -1577,12 +1599,18 @@ function buildFinalCommentHtml(input: {
   const branchLine = input.planResult
     ? `<p>Branch: <code>${escapeHtml(input.planResult.branch)}</code></p>`
     : "";
+  const prLine = input.planResult?.prUrl
+    ? `<p>PR: <a href="${escapeHtml(input.planResult.prUrl)}">${escapeHtml(input.planResult.prUrl)}</a></p>`
+    : "";
+  const planLine = input.planResult?.planUrl
+    ? `<p>Plan: <a href="${escapeHtml(input.planResult.planUrl)}">full plan on branch</a></p>`
+    : "";
   const previewLine = input.previewUrl
     ? `<p>Preview: <a href="${escapeHtml(input.previewUrl)}">${escapeHtml(input.previewUrl)}</a></p>`
     : "";
   const reasonLine = `<p><em>${escapeHtml(input.reason)}</em></p>`;
 
-  return `${heading}${branchLine}${previewLine}${reasonLine}`;
+  return `${heading}${branchLine}${prLine}${planLine}${previewLine}${reasonLine}`;
 }
 
 // FIFO tiebreak uses Plane's updated_at as a proxy for "moved to In Progress".
