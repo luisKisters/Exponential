@@ -40,14 +40,21 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 # Full install (incl. devDeps) — needed for `tsc` in the build stage.
+# The pnpm store is a shared BuildKit cache mount: it persists fetched packages
+# AND pnpm's side-effects cache (the compiled better-sqlite3 / node-pty .node
+# binaries), so prod-deps below — and every later deploy — reuse the native
+# build instead of recompiling it under node-gyp.
 FROM toolchain AS deps
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store,sharing=locked \
+    pnpm install --frozen-lockfile --store-dir=/pnpm/store
 
 # Production-only install — what actually ships in the runtime image.
+# Same shared store cache (id=pnpm-store) → reuses deps' compiled natives.
 FROM toolchain AS prod-deps
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --prod --frozen-lockfile
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store,sharing=locked \
+    pnpm install --prod --frozen-lockfile --store-dir=/pnpm/store
 
 FROM deps AS build
 COPY tsconfig.json ./
